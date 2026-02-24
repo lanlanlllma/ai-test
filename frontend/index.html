@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2D Battle Arena</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e;
+    color: #eee;
+    font-family: 'Segoe UI', sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  h1 { margin-bottom: 10px; color: #e94560; }
+  #controls {
+    margin-bottom: 10px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  input, button {
+    padding: 8px 14px;
+    border: none;
+    border-radius: 4px;
+    font-size: 14px;
+  }
+  input  { background: #16213e; color: #eee; }
+  button { background: #e94560; color: #fff; cursor: pointer; }
+  button:hover { background: #c73e54; }
+  canvas {
+    border: 2px solid #e94560;
+    background: #16213e;
+    display: block;
+  }
+  #status {
+    margin-top: 8px;
+    font-size: 13px;
+    color: #aaa;
+  }
+  #instructions {
+    margin-top: 12px;
+    font-size: 13px;
+    color: #888;
+    max-width: 800px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<h1>⚔️ 2D Battle Arena</h1>
+
+<div id="controls">
+  <input id="nameInput" placeholder="Your name" maxlength="20" value="Player">
+  <input id="hostInput" placeholder="ws://localhost:9002" value="ws://localhost:9002">
+  <button id="connectBtn">Connect</button>
+</div>
+
+<canvas id="arena" width="800" height="600"></canvas>
+
+<div id="status">Disconnected</div>
+<div id="instructions">
+  <b>Controls:</b> WASD or Arrow Keys to move &nbsp;|&nbsp; Space to attack<br>
+  Start the server, then click <b>Connect</b>.
+  Open this page in multiple tabs to play with friends!
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────
+let ws       = null;
+let myId     = null;
+let players  = [];
+const canvas = document.getElementById('arena');
+const ctx    = canvas.getContext('2d');
+const status = document.getElementById('status');
+
+// Pressed keys
+const keys = {};
+
+// ── Connect ──────────────────────────────────────────────────
+document.getElementById('connectBtn').addEventListener('click', () => {
+  const host = document.getElementById('hostInput').value.trim();
+  const name = document.getElementById('nameInput').value.trim() || 'Player';
+
+  if (ws && ws.readyState <= 1) ws.close();
+
+  status.textContent = 'Connecting…';
+  ws = new WebSocket(host);
+
+  ws.onopen = () => {
+    status.textContent = 'Connected – joining…';
+    ws.send(JSON.stringify({ type: 'join', name }));
+  };
+
+  ws.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+
+    if (msg.type === 'welcome') {
+      myId = msg.id;
+      status.textContent = `Joined as #${myId}`;
+    }
+    else if (msg.type === 'state') {
+      players = msg.players;
+    }
+    else if (msg.type === 'player_left') {
+      status.textContent = `Player #${msg.id} left`;
+    }
+    else if (msg.type === 'game_over') {
+      status.textContent = `🏆 Winner: ${msg.winner}!`;
+    }
+  };
+
+  ws.onclose = () => {
+    status.textContent = 'Disconnected';
+    myId = null;
+  };
+
+  ws.onerror = () => {
+    status.textContent = 'Connection error';
+  };
+});
+
+// ── Input handling ───────────────────────────────────────────
+window.addEventListener('keydown', (e) => { keys[e.key] = true;  });
+window.addEventListener('keyup',   (e) => { keys[e.key] = false; });
+
+function sendInput() {
+  if (!ws || ws.readyState !== 1 || myId === null) return;
+
+  let dx = 0, dy = 0;
+  if (keys['ArrowLeft']  || keys['a'] || keys['A']) dx -= 1;
+  if (keys['ArrowRight'] || keys['d'] || keys['D']) dx += 1;
+  if (keys['ArrowUp']    || keys['w'] || keys['W']) dy -= 1;
+  if (keys['ArrowDown']  || keys['s'] || keys['S']) dy += 1;
+
+  ws.send(JSON.stringify({ type: 'input', dx, dy }));
+
+  if (keys[' ']) {
+    ws.send(JSON.stringify({ type: 'attack' }));
+    keys[' '] = false; // one‑shot
+  }
+}
+
+// ── Rendering ────────────────────────────────────────────────
+const COLORS = ['#e94560','#0f3460','#53d769','#fc9d03',
+                '#9b59b6','#1abc9c','#e67e22','#3498db'];
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Grid
+  ctx.strokeStyle = '#1f2b45';
+  for (let x = 0; x < canvas.width; x += 40) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+  }
+  for (let y = 0; y < canvas.height; y += 40) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+  }
+
+  for (const p of players) {
+    const isMe  = p.id === myId;
+    const color = COLORS[p.id % COLORS.length];
+    const r     = 18;
+
+    // Body
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    if (isMe) {
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = '#fff';
+      ctx.stroke();
+    }
+
+    // Attack flash
+    if (p.attacking) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r + 20, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(255,255,0,0.6)';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
+
+    // Name
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(p.name, p.x, p.y - r - 14);
+
+    // HP bar
+    const bw = 36;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(p.x - bw / 2, p.y - r - 10, bw, 5);
+    const ratio = Math.max(0, p.hp / 100);
+    ctx.fillStyle = ratio > 0.5 ? '#53d769' : ratio > 0.25 ? '#fc9d03' : '#e94560';
+    ctx.fillRect(p.x - bw / 2, p.y - r - 10, bw * ratio, 5);
+  }
+}
+
+// ── Game loop (client‑side) ──────────────────────────────────
+function loop() {
+  sendInput();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
