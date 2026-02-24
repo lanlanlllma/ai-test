@@ -7,6 +7,7 @@
 #pragma once
 
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <string>
 
 using json = nlohmann::json;
@@ -60,14 +61,14 @@ inline std::string get_name(const json& j) {
 
 inline double get_dx(const json& j) {
     if (j.contains("dx") && j["dx"].is_number()) {
-        return j["dx"].get<double>();
+        return std::clamp(j["dx"].get<double>(), -1.0, 1.0);
     }
     return 0.0;
 }
 
 inline double get_dy(const json& j) {
     if (j.contains("dy") && j["dy"].is_number()) {
-        return j["dy"].get<double>();
+        return std::clamp(j["dy"].get<double>(), -1.0, 1.0);
     }
     return 0.0;
 }

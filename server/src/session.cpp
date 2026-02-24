@@ -21,6 +21,9 @@ void Session::run() {
             res.set(beast::http::field::server, "BattleServer");
         }));
 
+    // Limit max incoming message size to prevent memory abuse
+    ws_.read_message_max(4096);
+
     // Accept the WebSocket handshake
     ws_.async_accept(
         [self = shared_from_this()](beast::error_code ec) {
@@ -68,7 +71,7 @@ void Session::handle_message(const std::string& text) {
     json j;
     try {
         j = json::parse(text);
-    } catch (...) {
+    } catch (const json::exception&) {
         return; // ignore malformed messages
     }
 
@@ -99,6 +102,8 @@ void Session::send(const std::string& msg) {
     // Post into the strand so writes are serialized
     net::post(ws_.get_executor(),
         [self = shared_from_this(), msg]() {
+            // Drop messages if the client is too slow
+            if (self->write_queue_.size() >= 64) return;
             bool idle = self->write_queue_.empty();
             self->write_queue_.push_back(msg);
             if (idle) self->do_write();

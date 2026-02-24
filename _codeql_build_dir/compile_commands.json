@@ -1,0 +1,50 @@
+[
+{
+  "directory": "/home/runner/work/ai-test/ai-test/_codeql_build_dir",
+  "command": "/home/runner/work/ai-test/.codeql-scratch/dbs/cpp/working/autobuild/bin/c++ -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -I/home/runner/work/ai-test/ai-test/server/include -O3 -DNDEBUG -std=gnu++20 -o CMakeFiles/battle_server.dir/server/src/main.cpp.o -c /home/runner/work/ai-test/ai-test/server/src/main.cpp",
+  "file": "/home/runner/work/ai-test/ai-test/server/src/main.cpp",
+  "output": "CMakeFiles/battle_server.dir/server/src/main.cpp.o"
+},
+{
+  "directory": "/home/runner/work/ai-test/ai-test/_codeql_build_dir",
+  "command": "/home/runner/work/ai-test/.codeql-scratch/dbs/cpp/working/autobuild/bin/c++ -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -I/home/runner/work/ai-test/ai-test/server/include -O3 -DNDEBUG -std=gnu++20 -o CMakeFiles/battle_server.dir/server/src/server.cpp.o -c /home/runner/work/ai-test/ai-test/server/src/server.cpp",
+  "file": "/home/runner/work/ai-test/ai-test/server/src/server.cpp",
+  "output": "CMakeFiles/battle_server.dir/server/src/server.cpp.o"
+},
+{
+  "directory": "/home/runner/work/ai-test/ai-test/_codeql_build_dir",
+  "command": "/home/runner/work/ai-test/.codeql-scratch/dbs/cpp/working/autobuild/bin/c++ -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -I/home/runner/work/ai-test/ai-test/server/include -O3 -DNDEBUG -std=gnu++20 -o CMakeFiles/battle_server.dir/server/src/session.cpp.o -c /home/runner/work/ai-test/ai-test/server/src/session.cpp",
+  "file": "/home/runner/work/ai-test/ai-test/server/src/session.cpp",
+  "output": "CMakeFiles/battle_server.dir/server/src/session.cpp.o"
+},
+{
+  "directory": "/home/runner/work/ai-test/ai-test/_codeql_build_dir",
+  "command": "/home/runner/work/ai-test/.codeql-scratch/dbs/cpp/working/autobuild/bin/c++ -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -I/home/runner/work/ai-test/ai-test/server/include -O3 -DNDEBUG -std=gnu++20 -o CMakeFiles/battle_server.dir/server/src/room.cpp.o -c /home/runner/work/ai-test/ai-test/server/src/room.cpp",
+  "file": "/home/runner/work/ai-test/ai-test/server/src/room.cpp",
+  "output": "CMakeFiles/battle_server.dir/server/src/room.cpp.o"
+},
+{
+  "directory": "/home/runner/work/ai-test/ai-test/_codeql_build_dir",
+  "command": "/home/runner/work/ai-test/.codeql-scratch/dbs/cpp/working/autobuild/bin/c++ -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -I/home/runner/work/ai-test/ai-test/server/include -O3 -DNDEBUG -std=gnu++20 -o CMakeFiles/battle_server.dir/server/src/game.cpp.o -c /home/runner/work/ai-test/ai-test/server/src/game.cpp",
+  "file": "/home/runner/work/ai-test/ai-test/server/src/game.cpp",
+  "output": "CMakeFiles/battle_server.dir/server/src/game.cpp.o"
+},
+{
+  "directory": "/home/runner/work/ai-test/ai-test/_codeql_build_dir",
+  "command": "/home/runner/work/ai-test/.codeql-scratch/dbs/cpp/working/autobuild/bin/c++  -I/home/runner/work/ai-test/ai-test/server/include -O3 -DNDEBUG -std=gnu++20 -o CMakeFiles/test_message.dir/server/src/test_message.cpp.o -c /home/runner/work/ai-test/ai-test/server/src/test_message.cpp",
+  "file": "/home/runner/work/ai-test/ai-test/server/src/test_message.cpp",
+  "output": "CMakeFiles/test_message.dir/server/src/test_message.cpp.o"
+},
+{
+  "directory": "/home/runner/work/ai-test/ai-test/_codeql_build_dir",
+  "command": "/home/runner/work/ai-test/.codeql-scratch/dbs/cpp/working/autobuild/bin/c++ -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -I/home/runner/work/ai-test/ai-test/server/include -O3 -DNDEBUG -std=gnu++20 -o CMakeFiles/test_game.dir/server/src/test_game.cpp.o -c /home/runner/work/ai-test/ai-test/server/src/test_game.cpp",
+  "file": "/home/runner/work/ai-test/ai-test/server/src/test_game.cpp",
+  "output": "CMakeFiles/test_game.dir/server/src/test_game.cpp.o"
+},
+{
+  "directory": "/home/runner/work/ai-test/ai-test/_codeql_build_dir",
+  "command": "/home/runner/work/ai-test/.codeql-scratch/dbs/cpp/working/autobuild/bin/c++ -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -I/home/runner/work/ai-test/ai-test/server/include -O3 -DNDEBUG -std=gnu++20 -o CMakeFiles/test_game.dir/server/src/game.cpp.o -c /home/runner/work/ai-test/ai-test/server/src/game.cpp",
+  "file": "/home/runner/work/ai-test/ai-test/server/src/game.cpp",
+  "output": "CMakeFiles/test_game.dir/server/src/game.cpp.o"
+}
+]
