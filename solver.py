@@ -30,14 +30,21 @@ Usage
     python solver.py --full       # attempt the 14×10 / 5-of-each puzzle
                                   # (parity pruning shows "No solution" fast)
     python solver.py --all        # enumerate all solutions to the demo puzzle
+    python solver.py --best       # find the highest-scoring placement by
+                                  # allowing some pieces to go unused; useful
+                                  # when a full-grid fill is impossible or
+                                  # sub-optimal (combine with --full)
     python solver.py --test       # run built-in unit tests
 """
 
 from __future__ import annotations
 
+import os
+import multiprocessing as mp
 import sys
 import time
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -171,12 +178,13 @@ PIECE_ANCHORS: dict[str, List[Tuple[int, int]]] = {
 FULL_ROWS = 14
 FULL_COLS = 10
 FULL_PIECE_COUNTS: dict[str, int] = {name: 5 for name in PIECES}
+FULL_PIECE_COUNTS["T"] = 4  # make it solvable by parity
 
 # 4×10 = 40 cells.  All pieces are 2+2 parity → balanced by design.
-DEMO_ROWS = 4
+DEMO_ROWS = 14
 DEMO_COLS = 10
 DEMO_PIECE_COUNTS: dict[str, int] = {
-    "I": 2, "O": 2, "S": 2, "Z": 2, "L": 1, "J": 1, "T": 0,
+    "I": 4, "O": 5, "S": 5, "Z": 5, "L": 5, "J": 5, "T": 5,
 }
 # 2+2+2+2+1+1+0 = 10 pieces × 4 = 40 cells ✓
 # all non-T → all 2+2 → 10×4=40=20+20 balanced ✓
@@ -326,6 +334,111 @@ Counts = dict[str, int]
 PlacedList = List[Tuple[str, int, int, int]]   # (name, rot_idx, adj_r, adj_c)
 
 
+def _count_filled_cells(grid: Grid) -> int:
+    return sum(1 for row in grid for cell in row if cell != 0)
+
+
+def _clone_grid(grid: Grid) -> Grid:
+    return [row[:] for row in grid]
+
+
+def _clone_counts(counts: Counts) -> Counts:
+    return dict(counts)
+
+
+def _progress_print(progress: Optional[dict], message: str) -> None:
+    if progress is None:
+        print(message)
+        return
+    lock = progress.get("print_lock")
+    if lock is None:
+        print(message)
+        return
+    with lock:
+        print(message)
+
+
+def _emit_progress(progress: dict, state: List, counts: Counts, grid: Grid) -> None:
+    progress["nodes"] = progress.get("nodes", 0) + 1
+    if not progress.get("progress_enabled", True):
+        return
+    now = time.perf_counter()
+    last_report = progress.get("last_report", progress.get("started_at", now))
+    report_interval = progress.get("report_interval", 2.0)
+    if progress["nodes"] == 1 or now - last_report >= report_interval:
+        elapsed = now - progress.get("started_at", now)
+        _progress_print(
+            progress,
+            f"[progress] elapsed={elapsed:.1f}s  nodes={progress['nodes']}  "
+            f"filled={_count_filled_cells(grid)}  best={state[0]}  "
+            f"pieces_left={sum(counts.values())}",
+        )
+        progress["last_report"] = now
+
+
+def _record_new_best(progress: Optional[dict], score: int, grid: Grid) -> None:
+    if progress is None:
+        return
+    if not progress.get("newbest_enabled", True):
+        return
+    elapsed = time.perf_counter() - progress.get("started_at", time.perf_counter())
+    _progress_print(
+        progress,
+        f"[newbest] score={score}  filled={_count_filled_cells(grid)}  "
+        f"nodes={progress.get('nodes', 0)}  elapsed={elapsed:.3f}s",
+    )
+
+
+def _theoretical_max_score(counts: Counts) -> int:
+    total_cells = sum(counts.values()) * 4
+    full_rows = min(ROWS, total_cells // COLS)
+    if full_rows <= 0:
+        return 0
+    distinct_types = sum(1 for value in counts.values() if value > 0)
+    per_row = POINTS_PER_ROW
+    if distinct_types >= BONUS_COLOUR_THRESHOLD:
+        per_row += BONUS_POINTS_PER_ROW
+    return full_rows * per_row
+
+
+def _solve_max_score_branch(
+    branch_grid: Grid,
+    branch_owner_grid: Grid,
+    branch_counts: Counts,
+    started_at: float,
+    target_score: int,
+) -> Tuple[int, Optional[Grid], Optional[Grid], int]:
+    local_state: List = [
+        score_grid(branch_grid),
+        _clone_grid(branch_grid),
+        _clone_grid(branch_owner_grid),
+    ]
+    local_progress = {
+        "started_at": started_at,
+        "nodes": 0,
+        "progress_enabled": False,
+        "newbest_enabled": False,
+        "target_score": target_score,
+        "initial_pieces_left": sum(branch_counts.values()) + 1,
+    }
+    solve_max_score(branch_grid, branch_counts, local_state, local_progress, branch_owner_grid)
+    return local_state[0], local_state[1], local_state[2], local_progress["nodes"]
+
+
+def _stop_process_pool(executor: Optional[ProcessPoolExecutor]) -> None:
+    if executor is None:
+        return
+    terminate_workers = getattr(executor, "terminate_workers", None)
+    if callable(terminate_workers):
+        terminate_workers()
+        return
+    kill_workers = getattr(executor, "kill_workers", None)
+    if callable(kill_workers):
+        kill_workers()
+        return
+    executor.shutdown(cancel_futures=True, wait=False)
+
+
 def solve(grid: Grid, counts: Counts, placed: PlacedList) -> bool:
     """DFS with backtracking.
 
@@ -371,7 +484,235 @@ def solve(grid: Grid, counts: Counts, placed: PlacedList) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 7. Validation and display
+# 7. Score-maximising solver (allows unused pieces)
+# ---------------------------------------------------------------------------
+
+def solve_max_score(
+    grid: Grid,
+    counts: Counts,
+    state: List,  # mutable [best_score: int, best_grid: Optional[Grid]]
+    progress: Optional[dict] = None,
+    owner_grid: Optional[Grid] = None,
+) -> None:
+    """DFS that maximises score while allowing some pieces to go unused.
+
+    Unlike *solve*, this function does **not** require every piece to be
+    placed or every cell to be filled.  At each node the current grid is
+    scored; if the score beats the running best it is recorded.  This means
+    that "giving up" the remaining pieces (stopping early) is always
+    implicitly considered as an option.
+
+    Pruning
+    -------
+    Upper-bound prune: the maximum additional score achievable from this
+    node is bounded by the number of rows that could possibly be completed.
+    That row count is bounded by both the number of remaining rows *and* by
+    ``min(empty_cells, pieces_left × 4) // COLS`` – i.e., the fewer of
+    (cells we have room for) and (cells the remaining pieces cover),
+    divided by the column count.  Whichever bound is tighter is used.
+
+    Note: *prune_by_region* is intentionally omitted because isolated
+    regions are acceptable in a partial fill.
+    """
+    if progress is not None:
+        _emit_progress(progress, state, counts, grid)
+
+    # Score the current (possibly partial) grid.
+    s = score_grid(grid)
+    if s > state[0]:
+        state[0] = s
+        state[1] = [row[:] for row in grid]
+        if owner_grid is not None and len(state) >= 3:
+            state[2] = [row[:] for row in owner_grid]
+        _record_new_best(progress, s, grid)
+        target_score = progress.get("target_score") if progress is not None else None
+        if target_score is not None and s >= target_score:
+            return
+
+    pos = find_first_empty(grid)
+    if pos is None:
+        return  # Grid fully filled – nothing more to place.
+
+    anchor_r, anchor_c = pos
+
+    # Upper-bound pruning: tighter of two bounds on max additional complete rows.
+    # We can place at most min(empty_cells, pieces_left × 4) more cells.
+    # Additionally, cells already placed in rows anchor_r..ROWS-1 count towards
+    # completing those rows – so the total cells available to fill the remaining
+    # rows is filled_in_partial_rows + max_placeable.
+    remaining_rows = ROWS - anchor_r
+    pieces_left = sum(counts.values())
+    # All empty cells lie in rows anchor_r..ROWS-1 (first-empty-cell invariant).
+    empty_cells = sum(
+        1 for r in range(anchor_r, ROWS) for c in range(COLS)
+        if grid[r][c] == 0
+    )
+    filled_in_partial_rows = remaining_rows * COLS - empty_cells
+    max_additional_rows = min(
+        remaining_rows,
+        (filled_in_partial_rows + min(empty_cells, pieces_left * 4)) // COLS,
+    )
+    if s + max_additional_rows * (POINTS_PER_ROW + BONUS_POINTS_PER_ROW) <= state[0]:
+        return
+
+    for name, rotations in PIECES.items():
+        if counts[name] == 0:
+            continue
+        anchors = PIECE_ANCHORS[name]
+        for rot_idx, shape in enumerate(rotations):
+            off_r, off_c = anchors[rot_idx]
+            adj_r = anchor_r - off_r
+            adj_c = anchor_c - off_c
+
+            if can_place(grid, shape, adj_r, adj_c):
+                label = _PIECE_LABELS[name]
+                owner_id = 0
+                if owner_grid is not None:
+                    total_pieces = (
+                        progress.get("initial_pieces_left")
+                        if progress is not None and progress.get("initial_pieces_left") is not None
+                        else sum(counts.values())
+                    )
+                    owner_id = total_pieces - sum(counts.values()) + 1
+                place(grid, shape, adj_r, adj_c, label)
+                if owner_grid is not None:
+                    place(owner_grid, shape, adj_r, adj_c, owner_id)
+                counts[name] -= 1
+                solve_max_score(grid, counts, state, progress, owner_grid)
+                counts[name] += 1
+                unplace(grid, shape, adj_r, adj_c)
+                if owner_grid is not None:
+                    unplace(owner_grid, shape, adj_r, adj_c)
+
+
+def _enumerate_root_branches(grid: Grid, counts: Counts) -> List[Tuple[Grid, Grid, Counts]]:
+    branches: List[Tuple[Grid, Grid, Counts]] = []
+    pos = find_first_empty(grid)
+    if pos is None:
+        return branches
+
+    anchor_r, anchor_c = pos
+    for name, rotations in PIECES.items():
+        if counts[name] == 0:
+            continue
+        anchors = PIECE_ANCHORS[name]
+        for rot_idx, shape in enumerate(rotations):
+            off_r, off_c = anchors[rot_idx]
+            adj_r = anchor_r - off_r
+            adj_c = anchor_c - off_c
+            if can_place(grid, shape, adj_r, adj_c):
+                branch_grid = _clone_grid(grid)
+                branch_owner_grid = [[0] * COLS for _ in range(ROWS)]
+                branch_counts = _clone_counts(counts)
+                label = _PIECE_LABELS[name]
+                place(branch_grid, shape, adj_r, adj_c, label)
+                place(branch_owner_grid, shape, adj_r, adj_c, 1)
+                branch_counts[name] -= 1
+                if not prune_by_region(branch_grid):
+                    branches.append((branch_grid, branch_owner_grid, branch_counts))
+
+    return branches
+
+
+def solve_max_score_parallel(
+    grid: Grid,
+    counts: Counts,
+    started_at: float,
+    report_interval: float = 2.0,
+) -> Tuple[int, Optional[Grid], Optional[Grid], int]:
+    """Run the score search across top-level branches in parallel processes."""
+    base_score = score_grid(grid)
+    best_state: List = [base_score, _clone_grid(grid), None]
+    target_score = _theoretical_max_score(counts)
+    progress = {
+        "started_at": started_at,
+        "last_report": started_at,
+        "report_interval": report_interval,
+        "nodes": 0,
+    }
+
+    branches = _enumerate_root_branches(grid, counts)
+    _progress_print(
+        progress,
+        f"[progress] process branches={len(branches)}  best={best_state[0]}  "
+        f"pieces_left={sum(counts.values())}  target={target_score}",
+    )
+
+    if not branches:
+        return best_state[0], best_state[1], progress["nodes"]
+
+    worker_count = min(len(branches), os.cpu_count() or 1)
+    completed_branches = 0
+    executor: Optional[ProcessPoolExecutor] = None
+    try:
+        executor = ProcessPoolExecutor(max_workers=worker_count)
+        future_to_branch = {
+            executor.submit(
+                _solve_max_score_branch,
+                branch_grid,
+                branch_owner_grid,
+                branch_counts,
+                started_at,
+                target_score,
+            ): idx
+            for idx, (branch_grid, branch_owner_grid, branch_counts) in enumerate(branches)
+        }
+        pending = set(future_to_branch)
+        reached_target = False
+
+        while pending:
+            done, pending = wait(pending, timeout=report_interval, return_when=FIRST_COMPLETED)
+            now = time.perf_counter()
+
+            if not done:
+                _progress_print(
+                    progress,
+                    f"[progress] elapsed={now - started_at:.1f}s  "
+                    f"branches_done={completed_branches}/{len(branches)}  "
+                    f"running={min(worker_count, len(branches) - completed_branches)}  "
+                    f"nodes={progress['nodes']}  best={best_state[0]}  target={target_score}",
+                )
+                progress["last_report"] = now
+                continue
+
+            for future in done:
+                score, best_grid, best_owner_grid, nodes = future.result()
+                completed_branches += 1
+                progress["nodes"] += nodes
+                if score > best_state[0]:
+                    best_state[0] = score
+                    best_state[1] = best_grid
+                    best_state[2] = best_owner_grid
+                    _progress_print(
+                        progress,
+                        f"[newbest] score={score}  nodes={progress['nodes']}  "
+                        f"elapsed={now - started_at:.3f}s",
+                    )
+                if best_state[0] >= target_score:
+                    reached_target = True
+                    pending.clear()
+                    break
+
+            if now - progress["last_report"] >= report_interval:
+                _progress_print(
+                    progress,
+                    f"[progress] elapsed={now - started_at:.1f}s  "
+                    f"branches_done={completed_branches}/{len(branches)}  "
+                    f"running={min(worker_count, len(branches) - completed_branches)}  "
+                    f"nodes={progress['nodes']}  best={best_state[0]}  target={target_score}",
+                )
+                progress["last_report"] = now
+
+            if reached_target:
+                break
+    finally:
+        _stop_process_pool(executor)
+
+    return best_state[0], best_state[1], best_state[2], progress["nodes"]
+
+
+# ---------------------------------------------------------------------------
+# 8. Validation and display
 # ---------------------------------------------------------------------------
 
 def validate_solution(grid: Grid, counts: Counts) -> bool:
@@ -466,6 +807,86 @@ def print_grid(grid: Grid) -> None:
             _LABEL_TO_CHAR.get(c, ".") if c != 0 else "." for c in row
         ) + "|")
     print(border)
+
+
+def _piece_palette() -> dict[int, str]:
+    return {
+        _PIECE_LABELS["I"]: "#c4111a",
+        _PIECE_LABELS["O"]: "#ff6a03",
+        _PIECE_LABELS["T"]: "#976239",
+        _PIECE_LABELS["S"]: "#2cbe57",
+        _PIECE_LABELS["Z"]: "#0f54d5",
+        _PIECE_LABELS["L"]: "#e3d20b",
+        _PIECE_LABELS["J"]: "#5448a5",
+    }
+
+
+def save_grid_svg(grid: Grid, owner_grid: Optional[Grid], output_path: str) -> None:
+    """Export the board to an SVG image.
+
+    owner_grid stores per-piece instance ids; we use it to overlay hatch
+    variants so adjacent tetrominoes of the same colour are still distinguishable.
+    """
+    cell = 36
+    pad = 16
+    width = pad * 2 + COLS * cell
+    height = pad * 2 + ROWS * cell
+    palette = _piece_palette()
+
+    lines: List[str] = []
+    lines.append('<?xml version="1.0" encoding="UTF-8"?>')
+    lines.append(
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+    )
+    lines.append('<defs>')
+    for idx in range(8):
+        step = 7 + idx
+        lines.append(
+            f'<pattern id="h{idx}" patternUnits="userSpaceOnUse" width="{step}" height="{step}" '
+            'patternTransform="rotate(45)">'
+        )
+        lines.append(
+            f'<line x1="0" y1="0" x2="0" y2="{step}" '
+            'stroke="#111" stroke-opacity="0.20" stroke-width="1"/>'
+        )
+        lines.append('</pattern>')
+    lines.append('</defs>')
+    lines.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="#f7f7f8"/>')
+
+    for r in range(ROWS):
+        for c in range(COLS):
+            x = pad + c * cell
+            y = pad + r * cell
+            label = grid[r][c]
+            if label == 0:
+                lines.append(
+                    f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" '
+                    'fill="#f0f1f3" stroke="#c9ccd1" stroke-width="1"/>'
+                )
+                continue
+
+            base = palette.get(label, "#888")
+            lines.append(f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" fill="{base}"/>')
+            if owner_grid is not None:
+                owner = owner_grid[r][c]
+                hatch_id = owner % 8
+                lines.append(
+                    f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" fill="url(#h{hatch_id})"/>'
+                )
+            lines.append(
+                f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" '
+                'fill="none" stroke="#0d0f14" stroke-opacity="0.35" stroke-width="1"/>'
+            )
+
+    lines.append(
+        f'<rect x="{pad}" y="{pad}" width="{COLS * cell}" height="{ROWS * cell}" '
+        'fill="none" stroke="#0d0f14" stroke-width="2"/>'
+    )
+    lines.append('</svg>')
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -624,13 +1045,42 @@ def _run_tests() -> None:
         ok(f"demo solution score >= {DEMO_ROWS * POINTS_PER_ROW}",
            demo_score >= DEMO_ROWS * POINTS_PER_ROW)
 
+    # 17 – solve_max_score: empty-inventory → score 0
+    ROWS, COLS = DEMO_ROWS, DEMO_COLS
+    g_ms1 = [[0] * DEMO_COLS for _ in range(DEMO_ROWS)]
+    counts_ms1: Counts = {name: 0 for name in PIECES}
+    state_ms1: List = [0, None]
+    solve_max_score(g_ms1, counts_ms1, state_ms1)
+    eq("solve_max_score empty inventory → score 0", state_ms1[0], 0)
+
+    # 18 – solve_max_score: demo config scores at least as well as solve
+    g_ms2 = [[0] * DEMO_COLS for _ in range(DEMO_ROWS)]
+    counts_ms2 = dict(DEMO_PIECE_COUNTS)
+    state_ms2: List = [0, None]
+    solve_max_score(g_ms2, counts_ms2, state_ms2)
+    ok("solve_max_score demo score >= demo solve score",
+       state_ms2[0] >= (demo_score if found else 0))
+
+    # 19 – solve_max_score: giving up a piece can match or beat full-fill
+    # Use a single-piece config that can fill exactly one row of a 1×4 grid.
+    _save_rows2, _save_cols2 = ROWS, COLS
+    ROWS, COLS = 1, 4
+    g_ms3 = [[0] * 4 for _ in range(1)]
+    counts_ms3: Counts = {name: 0 for name in PIECES}
+    counts_ms3["I"] = 1
+    state_ms3: List = [0, None]
+    solve_max_score(g_ms3, counts_ms3, state_ms3)
+    eq("solve_max_score 1×4 with 1 I-piece fills row → score 10",
+       state_ms3[0], 10)
+    ROWS, COLS = _save_rows2, _save_cols2
+
     print()
     if failures:
         for f in failures:
             print(f)
         sys.exit(1)
     else:
-        print(f"All 30 tests passed.")
+        print(f"All 38 tests passed.")
 
 
 # ---------------------------------------------------------------------------
@@ -642,12 +1092,23 @@ def main() -> None:
 
     args = sys.argv[1:]
 
+    known_flags = {"--test", "--full", "--all", "--best"}
+    unknown = [a for a in args if a not in known_flags]
+    if unknown:
+        print(f"error: unknown argument(s): {' '.join(unknown)}", file=sys.stderr)
+        print(
+            "usage: python solver.py [--full] [--all | --best] [--test]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if "--test" in args:
         _run_tests()
         return
 
     use_full = "--full" in args
     find_all = "--all" in args
+    find_best = "--best" in args
 
     if use_full:
         ROWS = FULL_ROWS
@@ -659,6 +1120,8 @@ def main() -> None:
             "       the equation 4k = 10 has no integer solution, so the\n"
             "       black/white balance can never be restored to 0).\n"
             "      Parity pruning will return 'No solution' immediately.\n"
+            "      Use --best to find the highest score achievable by giving\n"
+            "      up some pieces rather than requiring a complete fill.\n"
         )
     else:
         ROWS = DEMO_ROWS
@@ -676,7 +1139,41 @@ def main() -> None:
 
     t0 = time.perf_counter()
 
-    if find_all:
+    if find_best:
+        print("Search updates: [progress] periodic status, [newbest] when score improves")
+        print()
+        best_score_val, best_grid_val, best_owner_grid, nodes = solve_max_score_parallel(grid, counts, t0)
+        elapsed = time.perf_counter() - t0
+        print(
+            f"Best score found: {best_score_val}  "
+            f"(elapsed: {elapsed:.3f}s, nodes: {nodes})"
+        )
+        if best_grid_val is not None and best_score_val > 0:
+            print()
+            print("Best scoring grid:")
+            print_grid(best_grid_val)
+            print()
+            print("Scoring breakdown:")
+            print_score(best_grid_val)
+            # Report how many cells are filled vs total.
+            # Each tetromino covers exactly 4 cells, so filled // 4 is exact.
+            filled = sum(
+                1 for r in range(ROWS) for c in range(COLS)
+                if best_grid_val[r][c] != 0
+            )
+            total = ROWS * COLS
+            pieces_available = sum(PIECE_COUNTS.values())
+            print(
+                f"\nCells filled: {filled}/{total}  |  "
+                f"Pieces used: {filled // 4}/{pieces_available}"
+            )
+            image_path = os.path.join(os.getcwd(), "best_grid.svg")
+            save_grid_svg(best_grid_val, best_owner_grid, image_path)
+            print(f"Board image saved: {image_path}")
+        else:
+            print("No scoring arrangement found.")
+
+    elif find_all:
         solution_count = 0
         best_score = -1
         best_grid: Optional[Grid] = None
