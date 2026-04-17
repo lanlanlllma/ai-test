@@ -754,6 +754,16 @@ def main() -> None:
 
     args = sys.argv[1:]
 
+    known_flags = {"--test", "--full", "--all", "--best"}
+    unknown = [a for a in args if a not in known_flags]
+    if unknown:
+        print(f"error: unknown argument(s): {' '.join(unknown)}", file=sys.stderr)
+        print(
+            "usage: python solver.py [--full] [--all | --best] [--test]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if "--test" in args:
         _run_tests()
         return
