@@ -385,6 +385,78 @@ def validate_solution(grid: Grid, counts: Counts) -> bool:
 
 _LABEL_TO_CHAR: dict[int, str] = {v: k for k, v in _PIECE_LABELS.items()}
 
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+# Rules:
+#   • Base score  : +10 points for every completely filled row.
+#   • Bonus score : +10 extra points for each filled row that contains
+#                   4 or more distinct tetromino piece types (colours).
+#
+# A "filled" row is one where every cell holds a non-zero label.
+# In the solver a completely filled grid is the goal, but the scoring
+# functions also work on partially filled intermediate grids (useful for
+# evaluating heuristic moves or partial placements).
+
+POINTS_PER_ROW = 10
+BONUS_POINTS_PER_ROW = 10
+BONUS_COLOUR_THRESHOLD = 4
+
+
+def score_breakdown(grid: Grid) -> List[dict]:
+    """Return per-row scoring details for every filled row in *grid*.
+
+    Each entry is a dict with:
+        row      – row index
+        colours  – number of distinct piece types in that row
+        base     – base points (always POINTS_PER_ROW for filled rows)
+        bonus    – bonus points (BONUS_POINTS_PER_ROW if colours >= threshold)
+        total    – base + bonus
+    """
+    result: List[dict] = []
+    for r in range(ROWS):
+        row = grid[r]
+        # Skip incomplete rows.
+        if any(cell == 0 for cell in row):
+            continue
+        colours = len(set(row))
+        bonus = BONUS_POINTS_PER_ROW if colours >= BONUS_COLOUR_THRESHOLD else 0
+        result.append({
+            "row": r,
+            "colours": colours,
+            "base": POINTS_PER_ROW,
+            "bonus": bonus,
+            "total": POINTS_PER_ROW + bonus,
+        })
+    return result
+
+
+def score_grid(grid: Grid) -> int:
+    """Return the total score for *grid* according to the scoring rules."""
+    return sum(entry["total"] for entry in score_breakdown(grid))
+
+
+def print_score(grid: Grid) -> None:
+    """Print a per-row scoring table and the grand total."""
+    breakdown = score_breakdown(grid)
+    if not breakdown:
+        print("Score: 0  (no filled rows)")
+        return
+
+    header = f"{'Row':>4}  {'Colours':>7}  {'Base':>4}  {'Bonus':>5}  {'Total':>5}"
+    sep = "-" * len(header)
+    print(header)
+    print(sep)
+    for entry in breakdown:
+        bonus_str = f"+{entry['bonus']}" if entry["bonus"] else "  —"
+        print(
+            f"{entry['row']:>4}  {entry['colours']:>7}  "
+            f"{entry['base']:>4}  {bonus_str:>5}  {entry['total']:>5}"
+        )
+    print(sep)
+    total = sum(e["total"] for e in breakdown)
+    print(f"{'Total':>4}  {'':>7}  {'':>4}  {'':>5}  {total:>5}")
+
 
 def print_grid(grid: Grid) -> None:
     border = "+" + "-" * (COLS * 2 - 1) + "+"
@@ -518,13 +590,47 @@ def _run_tests() -> None:
         ok("demo solution is valid", validate_solution(g_demo, counts_demo))
     ROWS, COLS = _save_rows, _save_cols
 
+    # 13 – score_grid: empty grid scores 0
+    g_empty = [[0] * COLS for _ in range(ROWS)]
+    eq("score empty grid == 0", score_grid(g_empty), 0)
+    eq("score_breakdown empty grid == []", score_breakdown(g_empty), [])
+
+    # 14 – score_grid: one fully filled row, 2 distinct types → 10 pts (no bonus)
+    g_s1 = [[0] * COLS for _ in range(ROWS)]
+    # Fill row 0: first 5 cells = label 1, next 5 = label 2 (2 colours < 4)
+    for c in range(5):
+        g_s1[0][c] = 1
+    for c in range(5, COLS):
+        g_s1[0][c] = 2
+    bd1 = score_breakdown(g_s1)
+    eq("1 filled row (2 colours): 1 entry", len(bd1), 1)
+    eq("1 filled row (2 colours): no bonus", bd1[0]["bonus"], 0)
+    eq("1 filled row (2 colours): total 10", bd1[0]["total"], 10)
+    eq("score 1 filled row (2 colours) == 10", score_grid(g_s1), 10)
+
+    # 15 – score_grid: one fully filled row, 4 distinct types → 20 pts (bonus)
+    g_s2 = [[0] * COLS for _ in range(ROWS)]
+    # Fill row 0 with 4 different labels (COLS=10: labels 1,1,1,2,2,3,3,4,4,4)
+    for c, lbl in enumerate([1, 1, 1, 2, 2, 3, 3, 4, 4, 4][:COLS]):
+        g_s2[0][c] = lbl
+    bd2 = score_breakdown(g_s2)
+    eq("1 filled row (4 colours): bonus == 10", bd2[0]["bonus"], 10)
+    eq("1 filled row (4 colours): total 20", bd2[0]["total"], 20)
+    eq("score 1 filled row (4 colours) == 20", score_grid(g_s2), 20)
+
+    # 16 – score_grid: demo solution scores at least 10 pts per row
+    if found:
+        demo_score = score_grid(g_demo)
+        ok(f"demo solution score >= {DEMO_ROWS * POINTS_PER_ROW}",
+           demo_score >= DEMO_ROWS * POINTS_PER_ROW)
+
     print()
     if failures:
         for f in failures:
             print(f)
         sys.exit(1)
     else:
-        print(f"All 24 tests passed.")
+        print(f"All 30 tests passed.")
 
 
 # ---------------------------------------------------------------------------
@@ -572,16 +678,23 @@ def main() -> None:
 
     if find_all:
         solution_count = 0
+        best_score = -1
+        best_grid: Optional[Grid] = None
 
         def _solve_all(grid: Grid, counts: Counts, placed: PlacedList) -> None:
-            nonlocal solution_count
+            nonlocal solution_count, best_score, best_grid
             if prune_by_parity(grid, counts):
                 return
             pos = find_first_empty(grid)
             if pos is None:
                 solution_count += 1
-                print(f"\n--- Solution #{solution_count} ---")
+                s = score_grid(grid)
+                print(f"\n--- Solution #{solution_count}  (score: {s}) ---")
                 print_grid(grid)
+                print_score(grid)
+                if s > best_score:
+                    best_score = s
+                    best_grid = [row[:] for row in grid]
                 return
             anchor_r, anchor_c = pos
             for name, rotations in PIECES.items():
@@ -605,6 +718,10 @@ def main() -> None:
         _solve_all(grid, counts, placed)
         elapsed = time.perf_counter() - t0
         print(f"\nFound {solution_count} solution(s) in {elapsed:.3f}s")
+        if best_grid is not None:
+            print(f"\nBest score: {best_score}")
+            print("Best scoring grid:")
+            print_grid(best_grid)
 
     else:
         found = solve(grid, counts, placed)
@@ -625,6 +742,10 @@ def main() -> None:
             print()
             assert validate_solution(grid, counts), "BUG: validation failed!"
             print(f"Validation: PASSED  (elapsed: {elapsed:.3f}s)")
+            print()
+            print("Scoring:")
+            print_score(grid)
+            print(f"\nFinal score: {score_grid(grid)}")
         else:
             print("No solution found.")
             print(f"Elapsed: {elapsed:.3f}s")
