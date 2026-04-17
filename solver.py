@@ -40,11 +40,11 @@ Usage
 from __future__ import annotations
 
 import os
+import multiprocessing as mp
 import sys
 import time
-import threading
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ FULL_PIECE_COUNTS["T"] = 4  # make it solvable by parity
 DEMO_ROWS = 14
 DEMO_COLS = 10
 DEMO_PIECE_COUNTS: dict[str, int] = {
-    "I": 4, "O": 2, "S": 5, "Z": 5, "L": 5, "J": 5, "T": 5,
+    "I": 4, "O": 4, "S": 5, "Z": 5, "L": 5, "J": 5, "T": 5,
 }
 # 2+2+2+2+1+1+0 = 10 pieces × 4 = 40 cells ✓
 # all non-T → all 2+2 → 10×4=40=20+20 balanced ✓
@@ -360,10 +360,18 @@ def _progress_print(progress: Optional[dict], message: str) -> None:
 
 def _emit_progress(progress: dict, state: List, counts: Counts, grid: Grid) -> None:
     progress["nodes"] = progress.get("nodes", 0) + 1
-    shared_progress = progress.get("shared_progress")
-    if shared_progress is not None:
-        with shared_progress["lock"]:
-            shared_progress["nodes"] += 1
+    shared_nodes = progress.get("shared_nodes")
+    if shared_nodes is not None:
+        progress["nodes_since_flush"] = progress.get("nodes_since_flush", 0) + 1
+        flush_interval = progress.get("flush_interval", 2048)
+        if progress["nodes_since_flush"] >= flush_interval:
+            shared_lock = progress.get("shared_lock")
+            if shared_lock is not None:
+                with shared_lock:
+                    shared_nodes.value += progress["nodes_since_flush"]
+            else:
+                shared_nodes.value += progress["nodes_since_flush"]
+            progress["nodes_since_flush"] = 0
     if not progress.get("progress_enabled", True):
         return
     now = time.perf_counter()
@@ -391,6 +399,39 @@ def _record_new_best(progress: Optional[dict], score: int, grid: Grid) -> None:
         f"[newbest] score={score}  filled={_count_filled_cells(grid)}  "
         f"nodes={progress.get('nodes', 0)}  elapsed={elapsed:.3f}s",
     )
+
+
+def _solve_max_score_branch(
+    branch_grid: Grid,
+    branch_counts: Counts,
+    started_at: float,
+    shared_nodes,
+    shared_lock,
+    flush_interval: int,
+) -> Tuple[int, Optional[Grid], int]:
+    local_state: List = [score_grid(branch_grid), _clone_grid(branch_grid)]
+    local_progress = {
+        "started_at": started_at,
+        "nodes": 0,
+        "progress_enabled": False,
+        "newbest_enabled": False,
+        "shared_nodes": shared_nodes,
+        "shared_lock": shared_lock,
+        "flush_interval": flush_interval,
+    }
+    solve_max_score(branch_grid, branch_counts, local_state, local_progress)
+    shared_nodes = local_progress.get("shared_nodes")
+    if shared_nodes is not None:
+        remaining = local_progress.get("nodes_since_flush", 0)
+        if remaining:
+            shared_lock = local_progress.get("shared_lock")
+            if shared_lock is not None:
+                with shared_lock:
+                    shared_nodes.value += remaining
+            else:
+                shared_nodes.value += remaining
+            local_progress["nodes_since_flush"] = 0
+    return local_state[0], local_state[1], local_progress["nodes"]
 
 
 def solve(grid: Grid, counts: Counts, placed: PlacedList) -> bool:
@@ -554,7 +595,7 @@ def solve_max_score_parallel(
     started_at: float,
     report_interval: float = 2.0,
 ) -> Tuple[int, Optional[Grid], int]:
-    """Run the score search across top-level branches in parallel threads."""
+    """Run the score search across top-level branches in parallel processes."""
     base_score = score_grid(grid)
     best_state: List = [base_score, _clone_grid(grid)]
     progress = {
@@ -562,20 +603,16 @@ def solve_max_score_parallel(
         "last_report": started_at,
         "report_interval": report_interval,
         "nodes": 0,
-        "print_lock": threading.Lock(),
-        "progress_enabled": True,
-        "newbest_enabled": True,
     }
-    shared_progress = {
-        "nodes": 0,
-        "lock": threading.Lock(),
-    }
-    progress["shared_progress"] = shared_progress
+    manager = mp.Manager()
+    shared_nodes = manager.Value("i", 0)
+    shared_lock = manager.Lock()
+    flush_interval = 2048
 
     branches = _enumerate_root_branches(grid, counts)
     _progress_print(
         progress,
-        f"[progress] threaded branches={len(branches)}  best={best_state[0]}  "
+        f"[progress] process branches={len(branches)}  best={best_state[0]}  "
         f"pieces_left={sum(counts.values())}",
     )
 
@@ -583,54 +620,63 @@ def solve_max_score_parallel(
         return best_state[0], best_state[1], progress["nodes"]
 
     worker_count = min(len(branches), os.cpu_count() or 1)
+    completed_branches = 0
+    try:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_branch = {
+                executor.submit(
+                    _solve_max_score_branch,
+                    branch_grid,
+                    branch_counts,
+                    started_at,
+                    shared_nodes,
+                    shared_lock,
+                    flush_interval,
+                ): idx
+                for idx, (branch_grid, branch_counts) in enumerate(branches)
+            }
+            pending = set(future_to_branch)
 
-    def _worker(branch_grid: Grid, branch_counts: Counts) -> Tuple[int, Optional[Grid], int]:
-        local_state: List = [base_score, _clone_grid(grid)]
-        local_progress = {
-            "started_at": started_at,
-            "report_interval": report_interval,
-            "nodes": 0,
-            "print_lock": progress["print_lock"],
-            "shared_progress": shared_progress,
-            "progress_enabled": False,
-            "newbest_enabled": False,
-        }
-        solve_max_score(branch_grid, branch_counts, local_state, local_progress)
-        return local_state[0], local_state[1], local_progress["nodes"]
+            while pending:
+                done, pending = wait(pending, timeout=report_interval, return_when=FIRST_COMPLETED)
+                now = time.perf_counter()
 
-    monitor_stop = threading.Event()
+                if not done:
+                    _progress_print(
+                        progress,
+                        f"[progress] elapsed={now - started_at:.1f}s  "
+                        f"branches_done={completed_branches}/{len(branches)}  "
+                        f"running={min(worker_count, len(branches) - completed_branches)}  "
+                        f"nodes={shared_nodes.value}  best={best_state[0]}",
+                    )
+                    progress["last_report"] = now
+                    continue
 
-    def _monitor() -> None:
-        while not monitor_stop.wait(report_interval):
-            _progress_print(
-                progress,
-                f"[progress] elapsed={time.perf_counter() - started_at:.1f}s  "
-                f"branches_done={progress.get('done_branches', 0)}/{len(branches)}  "
-                f"nodes={shared_progress['nodes']}  best={best_state[0]}",
-            )
+                for future in done:
+                    score, best_grid, nodes = future.result()
+                    completed_branches += 1
+                    if score > best_state[0]:
+                        best_state[0] = score
+                        best_state[1] = best_grid
+                        _progress_print(
+                            progress,
+                            f"[newbest] score={score}  nodes={shared_nodes.value}  "
+                            f"elapsed={now - started_at:.3f}s",
+                        )
 
-    monitor_thread = threading.Thread(target=_monitor, daemon=True)
-    monitor_thread.start()
+                if now - progress["last_report"] >= report_interval:
+                    _progress_print(
+                        progress,
+                        f"[progress] elapsed={now - started_at:.1f}s  "
+                        f"branches_done={completed_branches}/{len(branches)}  "
+                        f"running={min(worker_count, len(branches) - completed_branches)}  "
+                        f"nodes={shared_nodes.value}  best={best_state[0]}",
+                    )
+                    progress["last_report"] = now
+    finally:
+        manager.shutdown()
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(_worker, branch_grid, branch_counts) for branch_grid, branch_counts in branches]
-        for future in as_completed(futures):
-            score, best_grid, nodes = future.result()
-            progress["done_branches"] = progress.get("done_branches", 0) + 1
-            progress["nodes"] += nodes
-            if score > best_state[0]:
-                best_state[0] = score
-                best_state[1] = best_grid
-                _progress_print(
-                    progress,
-                    f"[newbest] score={score}  nodes={shared_progress['nodes']}  "
-                    f"elapsed={time.perf_counter() - started_at:.3f}s",
-                )
-
-    monitor_stop.set()
-    monitor_thread.join(timeout=0.1)
-
-    return best_state[0], best_state[1], shared_progress["nodes"]
+    return best_state[0], best_state[1], shared_nodes.value
 
 
 # ---------------------------------------------------------------------------
