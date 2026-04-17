@@ -30,6 +30,10 @@ Usage
     python solver.py --full       # attempt the 14×10 / 5-of-each puzzle
                                   # (parity pruning shows "No solution" fast)
     python solver.py --all        # enumerate all solutions to the demo puzzle
+    python solver.py --best       # find the highest-scoring placement by
+                                  # allowing some pieces to go unused; useful
+                                  # when a full-grid fill is impossible or
+                                  # sub-optimal (combine with --full)
     python solver.py --test       # run built-in unit tests
 """
 
@@ -371,7 +375,86 @@ def solve(grid: Grid, counts: Counts, placed: PlacedList) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 7. Validation and display
+# 7. Score-maximising solver (allows unused pieces)
+# ---------------------------------------------------------------------------
+
+def solve_max_score(
+    grid: Grid,
+    counts: Counts,
+    state: List,  # mutable [best_score: int, best_grid: Optional[Grid]]
+) -> None:
+    """DFS that maximises score while allowing some pieces to go unused.
+
+    Unlike *solve*, this function does **not** require every piece to be
+    placed or every cell to be filled.  At each node the current grid is
+    scored; if the score beats the running best it is recorded.  This means
+    that "giving up" the remaining pieces (stopping early) is always
+    implicitly considered as an option.
+
+    Pruning
+    -------
+    Upper-bound prune: the maximum additional score achievable from this
+    node is bounded by the number of rows that could possibly be completed.
+    That row count is bounded by both the number of remaining rows *and* by
+    ``min(empty_cells, pieces_left × 4) // COLS`` – i.e., the fewer of
+    (cells we have room for) and (cells the remaining pieces cover),
+    divided by the column count.  Whichever bound is tighter is used.
+
+    Note: *prune_by_region* is intentionally omitted because isolated
+    regions are acceptable in a partial fill.
+    """
+    # Score the current (possibly partial) grid.
+    s = score_grid(grid)
+    if s > state[0]:
+        state[0] = s
+        state[1] = [row[:] for row in grid]
+
+    pos = find_first_empty(grid)
+    if pos is None:
+        return  # Grid fully filled – nothing more to place.
+
+    anchor_r, anchor_c = pos
+
+    # Upper-bound pruning: tighter of two bounds on max additional complete rows.
+    # We can place at most min(empty_cells, pieces_left × 4) more cells.
+    # Additionally, cells already placed in rows anchor_r..ROWS-1 count towards
+    # completing those rows – so the total cells available to fill the remaining
+    # rows is filled_in_partial_rows + max_placeable.
+    remaining_rows = ROWS - anchor_r
+    pieces_left = sum(counts.values())
+    # All empty cells lie in rows anchor_r..ROWS-1 (first-empty-cell invariant).
+    empty_cells = sum(
+        1 for r in range(anchor_r, ROWS) for c in range(COLS)
+        if grid[r][c] == 0
+    )
+    filled_in_partial_rows = remaining_rows * COLS - empty_cells
+    max_additional_rows = min(
+        remaining_rows,
+        (filled_in_partial_rows + min(empty_cells, pieces_left * 4)) // COLS,
+    )
+    if s + max_additional_rows * (POINTS_PER_ROW + BONUS_POINTS_PER_ROW) <= state[0]:
+        return
+
+    for name, rotations in PIECES.items():
+        if counts[name] == 0:
+            continue
+        anchors = PIECE_ANCHORS[name]
+        for rot_idx, shape in enumerate(rotations):
+            off_r, off_c = anchors[rot_idx]
+            adj_r = anchor_r - off_r
+            adj_c = anchor_c - off_c
+
+            if can_place(grid, shape, adj_r, adj_c):
+                label = _PIECE_LABELS[name]
+                place(grid, shape, adj_r, adj_c, label)
+                counts[name] -= 1
+                solve_max_score(grid, counts, state)
+                counts[name] += 1
+                unplace(grid, shape, adj_r, adj_c)
+
+
+# ---------------------------------------------------------------------------
+# 8. Validation and display
 # ---------------------------------------------------------------------------
 
 def validate_solution(grid: Grid, counts: Counts) -> bool:
@@ -624,13 +707,42 @@ def _run_tests() -> None:
         ok(f"demo solution score >= {DEMO_ROWS * POINTS_PER_ROW}",
            demo_score >= DEMO_ROWS * POINTS_PER_ROW)
 
+    # 17 – solve_max_score: empty-inventory → score 0
+    ROWS, COLS = DEMO_ROWS, DEMO_COLS
+    g_ms1 = [[0] * DEMO_COLS for _ in range(DEMO_ROWS)]
+    counts_ms1: Counts = {name: 0 for name in PIECES}
+    state_ms1: List = [0, None]
+    solve_max_score(g_ms1, counts_ms1, state_ms1)
+    eq("solve_max_score empty inventory → score 0", state_ms1[0], 0)
+
+    # 18 – solve_max_score: demo config scores at least as well as solve
+    g_ms2 = [[0] * DEMO_COLS for _ in range(DEMO_ROWS)]
+    counts_ms2 = dict(DEMO_PIECE_COUNTS)
+    state_ms2: List = [0, None]
+    solve_max_score(g_ms2, counts_ms2, state_ms2)
+    ok("solve_max_score demo score >= demo solve score",
+       state_ms2[0] >= (demo_score if found else 0))
+
+    # 19 – solve_max_score: giving up a piece can match or beat full-fill
+    # Use a single-piece config that can fill exactly one row of a 1×4 grid.
+    _save_rows2, _save_cols2 = ROWS, COLS
+    ROWS, COLS = 1, 4
+    g_ms3 = [[0] * 4 for _ in range(1)]
+    counts_ms3: Counts = {name: 0 for name in PIECES}
+    counts_ms3["I"] = 1
+    state_ms3: List = [0, None]
+    solve_max_score(g_ms3, counts_ms3, state_ms3)
+    eq("solve_max_score 1×4 with 1 I-piece fills row → score 10",
+       state_ms3[0], 10)
+    ROWS, COLS = _save_rows2, _save_cols2
+
     print()
     if failures:
         for f in failures:
             print(f)
         sys.exit(1)
     else:
-        print(f"All 30 tests passed.")
+        print(f"All 38 tests passed.")
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +760,7 @@ def main() -> None:
 
     use_full = "--full" in args
     find_all = "--all" in args
+    find_best = "--best" in args
 
     if use_full:
         ROWS = FULL_ROWS
@@ -659,6 +772,8 @@ def main() -> None:
             "       the equation 4k = 10 has no integer solution, so the\n"
             "       black/white balance can never be restored to 0).\n"
             "      Parity pruning will return 'No solution' immediately.\n"
+            "      Use --best to find the highest score achievable by giving\n"
+            "      up some pieces rather than requiring a complete fill.\n"
         )
     else:
         ROWS = DEMO_ROWS
@@ -676,7 +791,36 @@ def main() -> None:
 
     t0 = time.perf_counter()
 
-    if find_all:
+    if find_best:
+        state: List = [0, None]  # [best_score, best_grid]
+        solve_max_score(grid, counts, state)
+        elapsed = time.perf_counter() - t0
+
+        best_score_val, best_grid_val = state
+        print(f"Best score found: {best_score_val}  (elapsed: {elapsed:.3f}s)")
+        if best_grid_val is not None and best_score_val > 0:
+            print()
+            print("Best scoring grid:")
+            print_grid(best_grid_val)
+            print()
+            print("Scoring breakdown:")
+            print_score(best_grid_val)
+            # Report how many cells are filled vs total.
+            # Each tetromino covers exactly 4 cells, so filled // 4 is exact.
+            filled = sum(
+                1 for r in range(ROWS) for c in range(COLS)
+                if best_grid_val[r][c] != 0
+            )
+            total = ROWS * COLS
+            pieces_available = sum(PIECE_COUNTS.values())
+            print(
+                f"\nCells filled: {filled}/{total}  |  "
+                f"Pieces used: {filled // 4}/{pieces_available}"
+            )
+        else:
+            print("No scoring arrangement found.")
+
+    elif find_all:
         solution_count = 0
         best_score = -1
         best_grid: Optional[Grid] = None
