@@ -39,9 +39,12 @@ Usage
 
 from __future__ import annotations
 
+import os
 import sys
 import time
+import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -175,12 +178,13 @@ PIECE_ANCHORS: dict[str, List[Tuple[int, int]]] = {
 FULL_ROWS = 14
 FULL_COLS = 10
 FULL_PIECE_COUNTS: dict[str, int] = {name: 5 for name in PIECES}
+FULL_PIECE_COUNTS["T"] = 4  # make it solvable by parity
 
 # 4×10 = 40 cells.  All pieces are 2+2 parity → balanced by design.
-DEMO_ROWS = 4
+DEMO_ROWS = 14
 DEMO_COLS = 10
 DEMO_PIECE_COUNTS: dict[str, int] = {
-    "I": 2, "O": 2, "S": 2, "Z": 2, "L": 1, "J": 1, "T": 0,
+    "I": 4, "O": 2, "S": 5, "Z": 5, "L": 5, "J": 5, "T": 5,
 }
 # 2+2+2+2+1+1+0 = 10 pieces × 4 = 40 cells ✓
 # all non-T → all 2+2 → 10×4=40=20+20 balanced ✓
@@ -330,6 +334,65 @@ Counts = dict[str, int]
 PlacedList = List[Tuple[str, int, int, int]]   # (name, rot_idx, adj_r, adj_c)
 
 
+def _count_filled_cells(grid: Grid) -> int:
+    return sum(1 for row in grid for cell in row if cell != 0)
+
+
+def _clone_grid(grid: Grid) -> Grid:
+    return [row[:] for row in grid]
+
+
+def _clone_counts(counts: Counts) -> Counts:
+    return dict(counts)
+
+
+def _progress_print(progress: Optional[dict], message: str) -> None:
+    if progress is None:
+        print(message)
+        return
+    lock = progress.get("print_lock")
+    if lock is None:
+        print(message)
+        return
+    with lock:
+        print(message)
+
+
+def _emit_progress(progress: dict, state: List, counts: Counts, grid: Grid) -> None:
+    progress["nodes"] = progress.get("nodes", 0) + 1
+    shared_progress = progress.get("shared_progress")
+    if shared_progress is not None:
+        with shared_progress["lock"]:
+            shared_progress["nodes"] += 1
+    if not progress.get("progress_enabled", True):
+        return
+    now = time.perf_counter()
+    last_report = progress.get("last_report", progress.get("started_at", now))
+    report_interval = progress.get("report_interval", 2.0)
+    if progress["nodes"] == 1 or now - last_report >= report_interval:
+        elapsed = now - progress.get("started_at", now)
+        _progress_print(
+            progress,
+            f"[progress] elapsed={elapsed:.1f}s  nodes={progress['nodes']}  "
+            f"filled={_count_filled_cells(grid)}  best={state[0]}  "
+            f"pieces_left={sum(counts.values())}",
+        )
+        progress["last_report"] = now
+
+
+def _record_new_best(progress: Optional[dict], score: int, grid: Grid) -> None:
+    if progress is None:
+        return
+    if not progress.get("newbest_enabled", True):
+        return
+    elapsed = time.perf_counter() - progress.get("started_at", time.perf_counter())
+    _progress_print(
+        progress,
+        f"[newbest] score={score}  filled={_count_filled_cells(grid)}  "
+        f"nodes={progress.get('nodes', 0)}  elapsed={elapsed:.3f}s",
+    )
+
+
 def solve(grid: Grid, counts: Counts, placed: PlacedList) -> bool:
     """DFS with backtracking.
 
@@ -382,6 +445,7 @@ def solve_max_score(
     grid: Grid,
     counts: Counts,
     state: List,  # mutable [best_score: int, best_grid: Optional[Grid]]
+    progress: Optional[dict] = None,
 ) -> None:
     """DFS that maximises score while allowing some pieces to go unused.
 
@@ -403,11 +467,15 @@ def solve_max_score(
     Note: *prune_by_region* is intentionally omitted because isolated
     regions are acceptable in a partial fill.
     """
+    if progress is not None:
+        _emit_progress(progress, state, counts, grid)
+
     # Score the current (possibly partial) grid.
     s = score_grid(grid)
     if s > state[0]:
         state[0] = s
         state[1] = [row[:] for row in grid]
+        _record_new_best(progress, s, grid)
 
     pos = find_first_empty(grid)
     if pos is None:
@@ -448,9 +516,121 @@ def solve_max_score(
                 label = _PIECE_LABELS[name]
                 place(grid, shape, adj_r, adj_c, label)
                 counts[name] -= 1
-                solve_max_score(grid, counts, state)
+                solve_max_score(grid, counts, state, progress)
                 counts[name] += 1
                 unplace(grid, shape, adj_r, adj_c)
+
+
+def _enumerate_root_branches(grid: Grid, counts: Counts) -> List[Tuple[Grid, Counts]]:
+    branches: List[Tuple[Grid, Counts]] = []
+    pos = find_first_empty(grid)
+    if pos is None:
+        return branches
+
+    anchor_r, anchor_c = pos
+    for name, rotations in PIECES.items():
+        if counts[name] == 0:
+            continue
+        anchors = PIECE_ANCHORS[name]
+        for rot_idx, shape in enumerate(rotations):
+            off_r, off_c = anchors[rot_idx]
+            adj_r = anchor_r - off_r
+            adj_c = anchor_c - off_c
+            if can_place(grid, shape, adj_r, adj_c):
+                branch_grid = _clone_grid(grid)
+                branch_counts = _clone_counts(counts)
+                label = _PIECE_LABELS[name]
+                place(branch_grid, shape, adj_r, adj_c, label)
+                branch_counts[name] -= 1
+                if not prune_by_region(branch_grid):
+                    branches.append((branch_grid, branch_counts))
+
+    return branches
+
+
+def solve_max_score_parallel(
+    grid: Grid,
+    counts: Counts,
+    started_at: float,
+    report_interval: float = 2.0,
+) -> Tuple[int, Optional[Grid], int]:
+    """Run the score search across top-level branches in parallel threads."""
+    base_score = score_grid(grid)
+    best_state: List = [base_score, _clone_grid(grid)]
+    progress = {
+        "started_at": started_at,
+        "last_report": started_at,
+        "report_interval": report_interval,
+        "nodes": 0,
+        "print_lock": threading.Lock(),
+        "progress_enabled": True,
+        "newbest_enabled": True,
+    }
+    shared_progress = {
+        "nodes": 0,
+        "lock": threading.Lock(),
+    }
+    progress["shared_progress"] = shared_progress
+
+    branches = _enumerate_root_branches(grid, counts)
+    _progress_print(
+        progress,
+        f"[progress] threaded branches={len(branches)}  best={best_state[0]}  "
+        f"pieces_left={sum(counts.values())}",
+    )
+
+    if not branches:
+        return best_state[0], best_state[1], progress["nodes"]
+
+    worker_count = min(len(branches), os.cpu_count() or 1)
+
+    def _worker(branch_grid: Grid, branch_counts: Counts) -> Tuple[int, Optional[Grid], int]:
+        local_state: List = [base_score, _clone_grid(grid)]
+        local_progress = {
+            "started_at": started_at,
+            "report_interval": report_interval,
+            "nodes": 0,
+            "print_lock": progress["print_lock"],
+            "shared_progress": shared_progress,
+            "progress_enabled": False,
+            "newbest_enabled": False,
+        }
+        solve_max_score(branch_grid, branch_counts, local_state, local_progress)
+        return local_state[0], local_state[1], local_progress["nodes"]
+
+    monitor_stop = threading.Event()
+
+    def _monitor() -> None:
+        while not monitor_stop.wait(report_interval):
+            _progress_print(
+                progress,
+                f"[progress] elapsed={time.perf_counter() - started_at:.1f}s  "
+                f"branches_done={progress.get('done_branches', 0)}/{len(branches)}  "
+                f"nodes={shared_progress['nodes']}  best={best_state[0]}",
+            )
+
+    monitor_thread = threading.Thread(target=_monitor, daemon=True)
+    monitor_thread.start()
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(_worker, branch_grid, branch_counts) for branch_grid, branch_counts in branches]
+        for future in as_completed(futures):
+            score, best_grid, nodes = future.result()
+            progress["done_branches"] = progress.get("done_branches", 0) + 1
+            progress["nodes"] += nodes
+            if score > best_state[0]:
+                best_state[0] = score
+                best_state[1] = best_grid
+                _progress_print(
+                    progress,
+                    f"[newbest] score={score}  nodes={shared_progress['nodes']}  "
+                    f"elapsed={time.perf_counter() - started_at:.3f}s",
+                )
+
+    monitor_stop.set()
+    monitor_thread.join(timeout=0.1)
+
+    return best_state[0], best_state[1], shared_progress["nodes"]
 
 
 # ---------------------------------------------------------------------------
@@ -802,12 +982,14 @@ def main() -> None:
     t0 = time.perf_counter()
 
     if find_best:
-        state: List = [0, None]  # [best_score, best_grid]
-        solve_max_score(grid, counts, state)
+        print("Search updates: [progress] periodic status, [newbest] when score improves")
+        print()
+        best_score_val, best_grid_val, nodes = solve_max_score_parallel(grid, counts, t0)
         elapsed = time.perf_counter() - t0
-
-        best_score_val, best_grid_val = state
-        print(f"Best score found: {best_score_val}  (elapsed: {elapsed:.3f}s)")
+        print(
+            f"Best score found: {best_score_val}  "
+            f"(elapsed: {elapsed:.3f}s, nodes: {nodes})"
+        )
         if best_grid_val is not None and best_score_val > 0:
             print()
             print("Best scoring grid:")
