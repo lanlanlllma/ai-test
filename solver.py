@@ -156,6 +156,25 @@ PIECE_ANCHORS: dict[str, List[Tuple[int, int]]] = {
     for name, rots in PIECES.items()
 }
 
+
+def _shape_origin_offset(shape: Tuple[Tuple[int, int], ...]) -> Tuple[float, float]:
+    """Return the geometric origin used for reporting placements.
+
+    This is the centre point of the four occupied cells in the shape's local
+    coordinates, which matches the marked origin in the reference image more
+    closely than the search anchor.
+    """
+    return (
+        sum(dr for dr, _ in shape) / len(shape),
+        sum(dc for _, dc in shape) / len(shape),
+    )
+
+
+PIECE_ORIGINS: dict[str, List[Tuple[float, float]]] = {
+    name: [_shape_origin_offset(shape) for shape in rots]
+    for name, rots in PIECES.items()
+}
+
 # ---------------------------------------------------------------------------
 # 3. Default puzzle configurations
 # ---------------------------------------------------------------------------
@@ -184,7 +203,7 @@ FULL_PIECE_COUNTS["T"] = 4  # make it solvable by parity
 DEMO_ROWS = 14
 DEMO_COLS = 10
 DEMO_PIECE_COUNTS: dict[str, int] = {
-    "I": 5, "O": 5, "S": 5, "Z": 5, "L": 5, "J": 5, "T": 5,
+    "I": 5, "O": 5, "S": 5, "Z": 3, "L": 5, "J": 5, "T": 5,
 }
 # 2+2+2+2+1+1+0 = 10 pieces × 4 = 40 cells ✓
 # all non-T → all 2+2 → 10×4=40=20+20 balanced ✓
@@ -332,6 +351,82 @@ def prune_by_parity(grid: Grid, counts: "Counts") -> bool:
 
 Counts = dict[str, int]
 PlacedList = List[Tuple[str, int, int, int]]   # (name, rot_idx, adj_r, adj_c)
+
+
+def _format_coord(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return text
+
+
+def _format_point(point: Tuple[float, float]) -> str:
+    return f"({_format_coord(point[0])},{_format_coord(point[1])})"
+
+
+def _placement_origin(name: str, rot_idx: int, adj_r: int, adj_c: int) -> Tuple[float, float]:
+    off_r, off_c = PIECE_ORIGINS[name][rot_idx]
+    return (adj_r + off_r, adj_c + off_c)
+
+
+def _print_placement_log(placed: PlacedList) -> None:
+    print("Placement log:")
+    for step, (name, rot_idx, r, c) in enumerate(placed, 1):
+        shape = PIECES[name][rot_idx]
+        origin = _placement_origin(name, rot_idx, r, c)
+        cells = [(r + dr, c + dc) for dr, dc in shape]
+        print(
+            f"  {step:2d}. piece={name}  rotation={rot_idx}"
+            f"  origin={_format_point(origin)}  anchor=({r},{c})  cells={cells}"
+        )
+
+
+def _infer_rotation(name: str, cells: List[Tuple[int, int]]) -> int:
+    min_r = min(r for r, _ in cells)
+    min_c = min(c for _, c in cells)
+    normalised = tuple(sorted((r - min_r, c - min_c) for r, c in cells))
+    for rot_idx, shape in enumerate(PIECES[name]):
+        if shape == normalised:
+            return rot_idx
+    raise ValueError(f"unable to infer rotation for {name} from cells {cells!r}")
+
+
+def _reconstruct_placements(grid: Grid, owner_grid: Optional[Grid]) -> PlacedList:
+    if owner_grid is None:
+        return []
+
+    pieces: List[Tuple[int, str, int, int, int]] = []
+    by_owner: dict[int, List[Tuple[int, int]]] = {}
+    for r in range(ROWS):
+        for c in range(COLS):
+            owner = owner_grid[r][c]
+            if owner == 0:
+                continue
+            by_owner.setdefault(owner, []).append((r, c))
+
+    for owner, cells in by_owner.items():
+        if len(cells) != 4:
+            continue
+        piece_type = _LABEL_TO_CHAR.get(grid[cells[0][0]][cells[0][1]], "?")
+        if piece_type == "?":
+            continue
+        rot_idx = _infer_rotation(piece_type, cells)
+        anchor_r = min(r for r, _ in cells)
+        anchor_c = min(c for r, c in cells if r == anchor_r)
+        off_r, off_c = PIECE_ANCHORS[piece_type][rot_idx]
+        adj_r = anchor_r - off_r
+        adj_c = anchor_c - off_c
+        pieces.append((owner, piece_type, rot_idx, adj_r, adj_c))
+
+    pieces.sort(key=lambda item: item[0])
+    return [(name, rot_idx, adj_r, adj_c) for _, name, rot_idx, adj_r, adj_c in pieces]
+
+
+def _print_reconstructed_placement_log(grid: Grid, owner_grid: Optional[Grid]) -> None:
+    placed = _reconstruct_placements(grid, owner_grid)
+    if not placed:
+        return
+    _print_placement_log(placed)
 
 
 def _count_filled_cells(grid: Grid) -> int:
@@ -1145,6 +1240,7 @@ def _run_tests() -> None:
         for n, rots in PIECES.items()
         for i, shape in enumerate(rots)
     ))
+    eq("L-origin is shape centre", _shape_origin_offset(PIECES["L"][0]), (0.75, 0.75))
 
     # 4 – S-piece horizontal anchor is (0,1)
     s_h = PIECES["S"][0]
@@ -1175,6 +1271,12 @@ def _run_tests() -> None:
     eq("place O sets (0,1)", g2[0][1], 1)
     unplace(g2, shape_O, 0, 0)
     eq("unplace O clears (0,0)", g2[0][0], 0)
+    owner_test = empty_grid()
+    place(g2, shape_O, 0, 0, _PIECE_LABELS["O"])
+    place(owner_test, shape_O, 0, 0, 1)
+    eq("reconstruct best placement log", _reconstruct_placements(g2, owner_test), [("O", 0, 0, 0)])
+    unplace(g2, shape_O, 0, 0)
+    unplace(owner_test, shape_O, 0, 0)
 
     # 7 – flood fill
     g3 = empty_grid()
@@ -1394,10 +1496,11 @@ def main() -> None:
             f"Best score found: {best_score_val}  "
             f"(elapsed: {elapsed:.3f}s, nodes: {nodes})"
         )
-        if best_grid_val is not None and best_score_val > 0:
+        if best_grid_val is not None and best_owner_grid is not None:
             print()
             print("Best scoring grid:")
             print_grid(best_grid_val)
+            _print_reconstructed_placement_log(best_grid_val, best_owner_grid)
             print()
             print("Scoring breakdown:")
             print_score(best_grid_val)
@@ -1434,6 +1537,8 @@ def main() -> None:
                 s = score_grid(grid)
                 print(f"\n--- Solution #{solution_count}  (score: {s}) ---")
                 print_grid(grid)
+                print()
+                _print_placement_log(placed)
                 print_score(grid)
                 if s > best_score:
                     best_score = s
@@ -1474,14 +1579,7 @@ def main() -> None:
             print("Solution found!\n")
             print_grid(grid)
             print()
-            print("Placement log:")
-            for step, (name, rot_idx, r, c) in enumerate(placed, 1):
-                shape = PIECES[name][rot_idx]
-                cells = [(r + dr, c + dc) for dr, dc in shape]
-                print(
-                    f"  {step:2d}. piece={name}  rotation={rot_idx}"
-                    f"  anchor=({r},{c})  cells={cells}"
-                )
+            _print_placement_log(placed)
             print()
             assert validate_solution(grid, counts), "BUG: validation failed!"
             print(f"Validation: PASSED  (elapsed: {elapsed:.3f}s)")
