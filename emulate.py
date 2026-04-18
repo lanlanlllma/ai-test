@@ -2,9 +2,10 @@ import json
 import sqlite3
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from itertools import product
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterator, Optional
 
 import solver
 
@@ -20,6 +21,8 @@ def _parse_args(argv: list[str]) -> dict:
     branch_stall_timeout: Optional[float] = None
     limit: Optional[int] = None
     report_every = 25
+    outer_workers = 1
+    solver_workers: Optional[int] = None
 
     idx = 0
     while idx < len(argv):
@@ -67,9 +70,35 @@ def _parse_args(argv: list[str]) -> dict:
                 raise SystemExit("error: --report-every must be > 0")
             idx += 2
             continue
+        if arg == "--outer-workers":
+            if idx + 1 >= len(argv):
+                raise SystemExit("error: --outer-workers requires an integer value")
+            try:
+                outer_workers = int(argv[idx + 1])
+            except ValueError as exc:
+                raise SystemExit(
+                    f"error: invalid --outer-workers value: {argv[idx + 1]!r}"
+                ) from exc
+            if outer_workers <= 0:
+                raise SystemExit("error: --outer-workers must be > 0")
+            idx += 2
+            continue
+        if arg == "--solver-workers":
+            if idx + 1 >= len(argv):
+                raise SystemExit("error: --solver-workers requires an integer value")
+            try:
+                solver_workers = int(argv[idx + 1])
+            except ValueError as exc:
+                raise SystemExit(
+                    f"error: invalid --solver-workers value: {argv[idx + 1]!r}"
+                ) from exc
+            if solver_workers <= 0:
+                raise SystemExit("error: --solver-workers must be > 0")
+            idx += 2
+            continue
         raise SystemExit(
             "usage: python emulate.py [--db PATH] [--branch-stall-timeout SECONDS] "
-            "[--limit N] [--report-every N]"
+            "[--limit N] [--report-every N] [--outer-workers N] [--solver-workers N]"
         )
 
     return {
@@ -77,10 +106,12 @@ def _parse_args(argv: list[str]) -> dict:
         "branch_stall_timeout": branch_stall_timeout,
         "limit": limit,
         "report_every": report_every,
+        "outer_workers": outer_workers,
+        "solver_workers": solver_workers,
     }
 
 
-def _iter_count_combinations() -> Iterable[dict[str, int]]:
+def _iter_count_combinations() -> Iterator[dict[str, int]]:
     for values in product(range(6), repeat=len(PIECE_ORDER)):
         yield dict(zip(PIECE_ORDER, values, strict=True))
 
@@ -164,6 +195,22 @@ def _render_progress(current: int, total: int, started_at: float, best_score: in
     )
 
 
+def _snapshot_line(
+    idx: int,
+    target_total: int,
+    counts: dict[str, int],
+    best_score: int,
+    filled_cells: int,
+    nodes: int,
+    elapsed_seconds: float,
+) -> str:
+    return (
+        f"[{idx}/{target_total}] counts={{I:{counts['I']}, O:{counts['O']}, S:{counts['S']}, "
+        f"Z:{counts['Z']}, L:{counts['L']}, J:{counts['J']}, T:{counts['T']}}}  "
+        f"score={best_score}  filled={filled_cells}  nodes={nodes}  elapsed={elapsed_seconds:.3f}s"
+    )
+
+
 def _store_result(
     conn: sqlite3.Connection,
     counts: dict[str, int],
@@ -210,7 +257,11 @@ def _store_result(
     )
 
 
-def _run_one(counts: dict[str, int], branch_stall_timeout: Optional[float]) -> tuple[int, Optional[solver.Grid], Optional[solver.Grid], int, float]:
+def _run_one(
+    counts: dict[str, int],
+    branch_stall_timeout: Optional[float],
+    solver_workers: Optional[int],
+) -> tuple[dict[str, int], int, Optional[solver.Grid], Optional[solver.Grid], int, float]:
     grid = solver.empty_grid()
     started_at = time.perf_counter()
     best_score, best_grid, best_owner_grid, nodes = solver.solve_max_score_parallel(
@@ -219,9 +270,10 @@ def _run_one(counts: dict[str, int], branch_stall_timeout: Optional[float]) -> t
         started_at,
         branch_stall_timeout=branch_stall_timeout,
         quiet=True,
+        max_workers=solver_workers,
     )
     elapsed_seconds = time.perf_counter() - started_at
-    return best_score, best_grid, best_owner_grid, nodes, elapsed_seconds
+    return counts, best_score, best_grid, best_owner_grid, nodes, elapsed_seconds
 
 
 def main() -> None:
@@ -230,6 +282,8 @@ def main() -> None:
     branch_stall_timeout: Optional[float] = options["branch_stall_timeout"]
     limit: Optional[int] = options["limit"]
     report_every: int = options["report_every"]
+    outer_workers: int = options["outer_workers"]
+    solver_workers: Optional[int] = options["solver_workers"]
 
     solver.ROWS = solver.FULL_ROWS
     solver.COLS = solver.FULL_COLS
@@ -242,6 +296,9 @@ def main() -> None:
     )
     if branch_stall_timeout is not None:
         print(f"Branch stall timeout: {branch_stall_timeout:.3f}s")
+    print(f"Outer workers: {outer_workers}")
+    if solver_workers is not None:
+        print(f"Solver workers per job: {solver_workers}")
     if limit is not None:
         print(f"Limit: {limit} combinations")
     print()
@@ -252,30 +309,59 @@ def main() -> None:
         total_started = time.perf_counter()
         global_best_score = 0
 
-        for idx, counts in enumerate(_iter_count_combinations(), start=1):
-            if limit is not None and idx > limit:
-                break
+        counts_iter = _iter_count_combinations()
+        submitted = 0
+        completed = 0
+        future_to_index = {}
 
-            best_score, best_grid, best_owner_grid, nodes, elapsed_seconds = _run_one(
-                counts,
-                branch_stall_timeout,
-            )
-            _store_result(
-                conn,
-                counts,
-                best_score,
-                best_grid,
-                best_owner_grid,
-                nodes,
-                elapsed_seconds,
-            )
-            global_best_score = max(global_best_score, best_score)
+        with ThreadPoolExecutor(max_workers=outer_workers) as executor:
+            while submitted < min(target_total, outer_workers):
+                counts = next(counts_iter)
+                submitted += 1
+                future = executor.submit(_run_one, counts, branch_stall_timeout, solver_workers)
+                future_to_index[future] = submitted
 
-            progress_line = _render_progress(idx, target_total, total_started, global_best_score)
-            print(progress_line, end="", flush=True)
+            while future_to_index:
+                done, _ = wait(set(future_to_index.keys()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    future_to_index.pop(future)
+                    counts, best_score, best_grid, best_owner_grid, nodes, elapsed_seconds = future.result()
+                    completed += 1
 
-            if idx % report_every == 0:
-                conn.commit()
+                    _store_result(
+                        conn,
+                        counts,
+                        best_score,
+                        best_grid,
+                        best_owner_grid,
+                        nodes,
+                        elapsed_seconds,
+                    )
+                    global_best_score = max(global_best_score, best_score)
+
+                    progress_line = _render_progress(completed, target_total, total_started, global_best_score)
+                    print(progress_line, end="", flush=True)
+
+                    if completed % report_every == 0:
+                        conn.commit()
+                        print()
+                        print(
+                            _snapshot_line(
+                                completed,
+                                target_total,
+                                counts,
+                                best_score,
+                                _filled_cells(best_grid),
+                                nodes,
+                                elapsed_seconds,
+                            )
+                        )
+
+                    if submitted < target_total:
+                        counts = next(counts_iter)
+                        submitted += 1
+                        next_future = executor.submit(_run_one, counts, branch_stall_timeout, solver_workers)
+                        future_to_index[next_future] = submitted
 
         conn.commit()
         total_elapsed = time.perf_counter() - total_started

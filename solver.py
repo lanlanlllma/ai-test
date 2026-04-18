@@ -879,6 +879,7 @@ def solve_max_score_parallel(
     report_interval: float = 2.0,
     branch_stall_timeout: Optional[float] = None,
     quiet: bool = False,
+    max_workers: Optional[int] = None,
 ) -> Tuple[int, Optional[Grid], Optional[Grid], int]:
     """Run the score search across top-level branches in parallel processes."""
     base_score = score_grid(grid)
@@ -902,20 +903,65 @@ def solve_max_score_parallel(
     if not branches:
         return best_state[0], best_state[1], best_state[2], progress["nodes"]
 
-    worker_count = min(len(branches), os.cpu_count() or 1)
+    available_cpus = os.cpu_count() or 1
+    if max_workers is None:
+        worker_count = min(len(branches), available_cpus)
+    else:
+        worker_count = max(1, min(len(branches), max_workers, available_cpus))
     completed_branches = 0
     mp_context = mp.get_context("fork")
     progress_queue = None
     result_queue = None
     workers = []
     try:
+        if worker_count <= 1:
+            for idx, (branch_grid, branch_owner_grid, branch_counts) in enumerate(branches):
+                score, best_grid, best_owner_grid, nodes = _solve_max_score_branch(
+                    idx,
+                    branch_grid,
+                    branch_owner_grid,
+                    branch_counts,
+                    started_at,
+                    target_score,
+                    report_interval,
+                    branch_stall_timeout,
+                    None,
+                )
+                completed_branches += 1
+                progress["nodes"] += nodes
+                if score > best_state[0]:
+                    best_state[0] = score
+                    best_state[1] = best_grid
+                    best_state[2] = best_owner_grid
+                    _progress_print(
+                        progress,
+                        f"[newbest] score={score}  nodes={progress['nodes']}  "
+                        f"elapsed={time.perf_counter() - started_at:.3f}s",
+                    )
+                if best_state[0] >= target_score:
+                    break
+                now = time.perf_counter()
+                if now - progress["last_report"] >= report_interval:
+                    _progress_print(
+                        progress,
+                        f"[progress] elapsed={now - started_at:.1f}s  "
+                        f"branches_done={completed_branches}/{len(branches)}  "
+                        f"running=1  nodes={progress['nodes']}  "
+                        f"best={best_state[0]}  target={target_score}",
+                    )
+                    progress["last_report"] = now
+            return best_state[0], best_state[1], best_state[2], progress["nodes"]
+
         progress_queue = mp_context.Queue()
         result_queue = mp_context.Queue()
-        workers = [
-            mp_context.Process(
+        worker_specs = list(enumerate(branches))
+        active_workers = {}
+
+        def _start_worker(branch_idx: int, branch_grid: Grid, branch_owner_grid: Grid, branch_counts: Counts) -> None:
+            worker = mp_context.Process(
                 target=_solve_max_score_branch_process,
                 args=(
-                    idx,
+                    branch_idx,
                     branch_grid,
                     branch_owner_grid,
                     branch_counts,
@@ -926,12 +972,17 @@ def solve_max_score_parallel(
                     progress_queue,
                     result_queue,
                 ),
-                name=f"solve-max-score-{idx:02d}",
+                name=f"solve-max-score-{branch_idx:02d}",
             )
-            for idx, (branch_grid, branch_owner_grid, branch_counts) in enumerate(branches)
-        ]
-        for worker in workers:
             worker.start()
+            active_workers[branch_idx] = worker
+            workers.append(worker)
+
+        next_branch = 0
+        while next_branch < min(worker_count, len(worker_specs)):
+            branch_idx, (branch_grid, branch_owner_grid, branch_counts) = worker_specs[next_branch]
+            _start_worker(branch_idx, branch_grid, branch_owner_grid, branch_counts)
+            next_branch += 1
 
         remaining_branches = len(branches)
         reached_target = False
@@ -952,6 +1003,11 @@ def solve_max_score_parallel(
                 )
                 progress["last_report"] = now
                 continue
+
+            branch_idx = result["branch_idx"]
+            worker = active_workers.pop(branch_idx, None)
+            if worker is not None:
+                worker.join()
 
             completed_branches += 1
             remaining_branches -= 1
@@ -976,9 +1032,14 @@ def solve_max_score_parallel(
                 reached_target = True
                 break
 
+            if next_branch < len(worker_specs):
+                queued_branch_idx, (branch_grid, branch_owner_grid, branch_counts) = worker_specs[next_branch]
+                _start_worker(queued_branch_idx, branch_grid, branch_owner_grid, branch_counts)
+                next_branch += 1
+
             now = time.perf_counter()
             if now - progress["last_report"] >= report_interval:
-                running = sum(1 for worker in workers if worker.is_alive())
+                running = sum(1 for worker in active_workers.values() if worker.is_alive())
                 _progress_print(
                     progress,
                     f"[progress] elapsed={now - started_at:.1f}s  "
@@ -989,7 +1050,7 @@ def solve_max_score_parallel(
                 progress["last_report"] = now
 
         if reached_target:
-            for worker in workers:
+            for worker in active_workers.values():
                 if worker.is_alive():
                     worker.terminate()
         for worker in workers:
