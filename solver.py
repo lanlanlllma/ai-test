@@ -41,10 +41,10 @@ from __future__ import annotations
 
 import os
 import multiprocessing as mp
+import queue
 import sys
 import time
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ FULL_PIECE_COUNTS["T"] = 4  # make it solvable by parity
 DEMO_ROWS = 14
 DEMO_COLS = 10
 DEMO_PIECE_COUNTS: dict[str, int] = {
-    "I": 4, "O": 5, "S": 5, "Z": 5, "L": 5, "J": 5, "T": 5,
+    "I": 5, "O": 5, "S": 5, "Z": 5, "L": 5, "J": 5, "T": 5,
 }
 # 2+2+2+2+1+1+0 = 10 pieces × 4 = 40 cells ✓
 # all non-T → all 2+2 → 10×4=40=20+20 balanced ✓
@@ -360,33 +360,88 @@ def _progress_print(progress: Optional[dict], message: str) -> None:
 
 def _emit_progress(progress: dict, state: List, counts: Counts, grid: Grid) -> None:
     progress["nodes"] = progress.get("nodes", 0) + 1
+    reporter = progress.get("reporter")
+    mirror_local_output = progress.get("mirror_local_output", True)
     if not progress.get("progress_enabled", True):
-        return
+        if reporter is None:
+            return
     now = time.perf_counter()
     last_report = progress.get("last_report", progress.get("started_at", now))
     report_interval = progress.get("report_interval", 2.0)
     if progress["nodes"] == 1 or now - last_report >= report_interval:
         elapsed = now - progress.get("started_at", now)
-        _progress_print(
-            progress,
-            f"[progress] elapsed={elapsed:.1f}s  nodes={progress['nodes']}  "
-            f"filled={_count_filled_cells(grid)}  best={state[0]}  "
-            f"pieces_left={sum(counts.values())}",
-        )
+        if reporter is not None:
+            reporter.put({
+                "kind": "progress",
+                "branch_idx": progress.get("branch_idx"),
+                "elapsed": elapsed,
+                "nodes": progress["nodes"],
+                "filled": _count_filled_cells(grid),
+                "best": state[0],
+                "pieces_left": sum(counts.values()),
+            })
+        if mirror_local_output:
+            _progress_print(
+                progress,
+                f"[progress] elapsed={elapsed:.1f}s  nodes={progress['nodes']}  "
+                f"filled={_count_filled_cells(grid)}  best={state[0]}  "
+                f"pieces_left={sum(counts.values())}",
+            )
         progress["last_report"] = now
 
 
 def _record_new_best(progress: Optional[dict], score: int, grid: Grid) -> None:
     if progress is None:
         return
-    if not progress.get("newbest_enabled", True):
+    now = time.perf_counter()
+    elapsed = now - progress.get("started_at", now)
+    reporter = progress.get("reporter")
+    mirror_local_output = progress.get("mirror_local_output", True)
+    progress["last_newbest_at"] = now
+    if reporter is not None:
+        reporter.put({
+            "kind": "newbest",
+            "branch_idx": progress.get("branch_idx"),
+            "elapsed": elapsed,
+            "nodes": progress.get("nodes", 0),
+            "filled": _count_filled_cells(grid),
+            "best": score,
+        })
+    if not progress.get("newbest_enabled", True) or not mirror_local_output:
         return
-    elapsed = time.perf_counter() - progress.get("started_at", time.perf_counter())
     _progress_print(
         progress,
         f"[newbest] score={score}  filled={_count_filled_cells(grid)}  "
         f"nodes={progress.get('nodes', 0)}  elapsed={elapsed:.3f}s",
     )
+
+
+def _branch_should_stop(progress: Optional[dict]) -> bool:
+    if progress is None:
+        return False
+    stall_timeout = progress.get("stall_timeout")
+    if stall_timeout is None or stall_timeout <= 0:
+        return False
+    if progress.get("target_score") is not None and progress.get("stopped_due_to_target"):
+        return True
+    now = time.perf_counter()
+    last_newbest_at = progress.get("last_newbest_at", progress.get("started_at", now))
+    if now - last_newbest_at < stall_timeout:
+        return False
+    if not progress.get("stopped_due_to_stall"):
+        progress["stopped_due_to_stall"] = True
+        progress["stop_reason"] = "stall"
+        reporter = progress.get("reporter")
+        if reporter is not None:
+            reporter.put({
+                "kind": "stalled",
+                "branch_idx": progress.get("branch_idx"),
+                "elapsed": now - progress.get("started_at", now),
+                "nodes": progress.get("nodes", 0),
+                "best": progress.get("best_score", 0),
+                "stall_for": now - last_newbest_at,
+            })
+    return True
 
 
 def _theoretical_max_score(counts: Counts) -> int:
@@ -402,11 +457,15 @@ def _theoretical_max_score(counts: Counts) -> int:
 
 
 def _solve_max_score_branch(
+    branch_idx: int,
     branch_grid: Grid,
     branch_owner_grid: Grid,
     branch_counts: Counts,
     started_at: float,
     target_score: int,
+    report_interval: float,
+    branch_stall_timeout: Optional[float],
+    progress_queue,
 ) -> Tuple[int, Optional[Grid], Optional[Grid], int]:
     local_state: List = [
         score_grid(branch_grid),
@@ -414,29 +473,120 @@ def _solve_max_score_branch(
         _clone_grid(branch_owner_grid),
     ]
     local_progress = {
+        "branch_idx": branch_idx,
         "started_at": started_at,
+        "last_report": started_at,
+        "last_newbest_at": started_at,
         "nodes": 0,
+        "best_score": local_state[0],
         "progress_enabled": False,
         "newbest_enabled": False,
+        "mirror_local_output": False,
+        "report_interval": report_interval,
+        "stall_timeout": branch_stall_timeout,
+        "reporter": progress_queue,
         "target_score": target_score,
+        "stop_reason": "completed",
         "initial_pieces_left": sum(branch_counts.values()) + 1,
     }
     solve_max_score(branch_grid, branch_counts, local_state, local_progress, branch_owner_grid)
+    if progress_queue is not None:
+        progress_queue.put({
+            "kind": "done",
+            "branch_idx": branch_idx,
+            "elapsed": time.perf_counter() - started_at,
+            "nodes": local_progress["nodes"],
+            "best": local_state[0],
+            "filled": _count_filled_cells(local_state[1]) if local_state[1] is not None else 0,
+            "pieces_left": sum(branch_counts.values()),
+            "reason": local_progress.get("stop_reason", "completed"),
+        })
     return local_state[0], local_state[1], local_state[2], local_progress["nodes"]
 
 
-def _stop_process_pool(executor: Optional[ProcessPoolExecutor]) -> None:
-    if executor is None:
+def _solve_max_score_branch_process(
+    branch_idx: int,
+    branch_grid: Grid,
+    branch_owner_grid: Grid,
+    branch_counts: Counts,
+    started_at: float,
+    target_score: int,
+    report_interval: float,
+    branch_stall_timeout: Optional[float],
+    progress_queue,
+    result_queue,
+) -> None:
+    score, best_grid, best_owner_grid, nodes = _solve_max_score_branch(
+        branch_idx,
+        branch_grid,
+        branch_owner_grid,
+        branch_counts,
+        started_at,
+        target_score,
+        report_interval,
+        branch_stall_timeout,
+        progress_queue,
+    )
+    result_queue.put({
+        "branch_idx": branch_idx,
+        "score": score,
+        "best_grid": best_grid,
+        "best_owner_grid": best_owner_grid,
+        "nodes": nodes,
+    })
+
+
+def _drain_branch_reports(progress_queue, progress: dict) -> None:
+    if progress_queue is None:
         return
-    terminate_workers = getattr(executor, "terminate_workers", None)
-    if callable(terminate_workers):
-        terminate_workers()
-        return
-    kill_workers = getattr(executor, "kill_workers", None)
-    if callable(kill_workers):
-        kill_workers()
-        return
-    executor.shutdown(cancel_futures=True, wait=False)
+    while True:
+        try:
+            update = progress_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        kind = update.get("kind", "progress")
+        branch_idx = update.get("branch_idx", "?")
+        elapsed = update.get("elapsed", 0.0)
+        nodes = update.get("nodes", 0)
+        best = update.get("best", 0)
+        filled = update.get("filled", 0)
+        pieces_left = update.get("pieces_left")
+        reason = update.get("reason")
+        stall_for = update.get("stall_for")
+
+        if kind == "newbest":
+            _progress_print(
+                progress,
+                f"[branch {branch_idx:02d} newbest] score={best}  filled={filled}  "
+                f"nodes={nodes}  elapsed={elapsed:.3f}s",
+            )
+            continue
+
+        if kind == "stalled":
+            _progress_print(
+                progress,
+                f"[branch {branch_idx:02d} stalled] best={best}  nodes={nodes}  "
+                f"idle={stall_for:.1f}s  elapsed={elapsed:.3f}s",
+            )
+            continue
+
+        if kind == "done":
+            suffix = f"  pieces_left={pieces_left}" if pieces_left is not None else ""
+            reason_suffix = f"  reason={reason}" if reason else ""
+            _progress_print(
+                progress,
+                f"[branch {branch_idx:02d} done] best={best}  filled={filled}  "
+                f"nodes={nodes}  elapsed={elapsed:.3f}s{suffix}{reason_suffix}",
+            )
+            continue
+
+        suffix = f"  pieces_left={pieces_left}" if pieces_left is not None else ""
+        _progress_print(
+            progress,
+            f"[branch {branch_idx:02d} progress] elapsed={elapsed:.1f}s  nodes={nodes}  "
+            f"filled={filled}  best={best}{suffix}",
+        )
 
 
 def solve(grid: Grid, counts: Counts, placed: PlacedList) -> bool:
@@ -516,17 +666,25 @@ def solve_max_score(
     """
     if progress is not None:
         _emit_progress(progress, state, counts, grid)
+        progress["best_score"] = state[0]
+        if _branch_should_stop(progress):
+            return
 
     # Score the current (possibly partial) grid.
     s = score_grid(grid)
     if s > state[0]:
         state[0] = s
+        if progress is not None:
+            progress["best_score"] = s
         state[1] = [row[:] for row in grid]
         if owner_grid is not None and len(state) >= 3:
             state[2] = [row[:] for row in owner_grid]
         _record_new_best(progress, s, grid)
         target_score = progress.get("target_score") if progress is not None else None
         if target_score is not None and s >= target_score:
+            if progress is not None:
+                progress["stopped_due_to_target"] = True
+                progress["stop_reason"] = "target"
             return
 
     pos = find_first_empty(grid)
@@ -573,6 +731,7 @@ def solve_max_score(
                         if progress is not None and progress.get("initial_pieces_left") is not None
                         else sum(counts.values())
                     )
+                    assert total_pieces is not None
                     owner_id = total_pieces - sum(counts.values()) + 1
                 place(grid, shape, adj_r, adj_c, label)
                 if owner_grid is not None:
@@ -583,6 +742,8 @@ def solve_max_score(
                 unplace(grid, shape, adj_r, adj_c)
                 if owner_grid is not None:
                     unplace(owner_grid, shape, adj_r, adj_c)
+                if _branch_should_stop(progress):
+                    return
 
 
 def _enumerate_root_branches(grid: Grid, counts: Counts) -> List[Tuple[Grid, Grid, Counts]]:
@@ -619,6 +780,7 @@ def solve_max_score_parallel(
     counts: Counts,
     started_at: float,
     report_interval: float = 2.0,
+    branch_stall_timeout: Optional[float] = None,
 ) -> Tuple[int, Optional[Grid], Optional[Grid], int]:
     """Run the score search across top-level branches in parallel processes."""
     base_score = score_grid(grid)
@@ -639,74 +801,122 @@ def solve_max_score_parallel(
     )
 
     if not branches:
-        return best_state[0], best_state[1], progress["nodes"]
+        return best_state[0], best_state[1], best_state[2], progress["nodes"]
 
     worker_count = min(len(branches), os.cpu_count() or 1)
     completed_branches = 0
-    executor: Optional[ProcessPoolExecutor] = None
+    mp_context = mp.get_context("fork")
+    progress_queue = None
+    result_queue = None
+    workers = []
     try:
-        executor = ProcessPoolExecutor(max_workers=worker_count)
-        future_to_branch = {
-            executor.submit(
-                _solve_max_score_branch,
-                branch_grid,
-                branch_owner_grid,
-                branch_counts,
-                started_at,
-                target_score,
-            ): idx
+        progress_queue = mp_context.Queue()
+        result_queue = mp_context.Queue()
+        workers = [
+            mp_context.Process(
+                target=_solve_max_score_branch_process,
+                args=(
+                    idx,
+                    branch_grid,
+                    branch_owner_grid,
+                    branch_counts,
+                    started_at,
+                    target_score,
+                    report_interval,
+                    branch_stall_timeout,
+                    progress_queue,
+                    result_queue,
+                ),
+                name=f"solve-max-score-{idx:02d}",
+            )
             for idx, (branch_grid, branch_owner_grid, branch_counts) in enumerate(branches)
-        }
-        pending = set(future_to_branch)
+        ]
+        for worker in workers:
+            worker.start()
+
+        remaining_branches = len(branches)
         reached_target = False
 
-        while pending:
-            done, pending = wait(pending, timeout=report_interval, return_when=FIRST_COMPLETED)
-            now = time.perf_counter()
-
-            if not done:
+        while completed_branches < len(branches):
+            _drain_branch_reports(progress_queue, progress)
+            try:
+                result = result_queue.get(timeout=report_interval)
+            except queue.Empty:
+                now = time.perf_counter()
+                running = sum(1 for worker in workers if worker.is_alive())
                 _progress_print(
                     progress,
                     f"[progress] elapsed={now - started_at:.1f}s  "
                     f"branches_done={completed_branches}/{len(branches)}  "
-                    f"running={min(worker_count, len(branches) - completed_branches)}  "
-                    f"nodes={progress['nodes']}  best={best_state[0]}  target={target_score}",
+                    f"running={running}  nodes={progress['nodes']}  "
+                    f"best={best_state[0]}  target={target_score}",
                 )
                 progress["last_report"] = now
                 continue
 
-            for future in done:
-                score, best_grid, best_owner_grid, nodes = future.result()
-                completed_branches += 1
-                progress["nodes"] += nodes
-                if score > best_state[0]:
-                    best_state[0] = score
-                    best_state[1] = best_grid
-                    best_state[2] = best_owner_grid
-                    _progress_print(
-                        progress,
-                        f"[newbest] score={score}  nodes={progress['nodes']}  "
-                        f"elapsed={now - started_at:.3f}s",
-                    )
-                if best_state[0] >= target_score:
-                    reached_target = True
-                    pending.clear()
-                    break
+            completed_branches += 1
+            remaining_branches -= 1
+            score = result["score"]
+            best_grid = result["best_grid"]
+            best_owner_grid = result["best_owner_grid"]
+            nodes = result["nodes"]
+            progress["nodes"] += nodes
+            _drain_branch_reports(progress_queue, progress)
 
+            if score > best_state[0]:
+                best_state[0] = score
+                best_state[1] = best_grid
+                best_state[2] = best_owner_grid
+                _progress_print(
+                    progress,
+                    f"[newbest] score={score}  nodes={progress['nodes']}  "
+                    f"elapsed={time.perf_counter() - started_at:.3f}s",
+                )
+
+            if best_state[0] >= target_score:
+                reached_target = True
+                break
+
+            now = time.perf_counter()
             if now - progress["last_report"] >= report_interval:
+                running = sum(1 for worker in workers if worker.is_alive())
                 _progress_print(
                     progress,
                     f"[progress] elapsed={now - started_at:.1f}s  "
                     f"branches_done={completed_branches}/{len(branches)}  "
-                    f"running={min(worker_count, len(branches) - completed_branches)}  "
-                    f"nodes={progress['nodes']}  best={best_state[0]}  target={target_score}",
+                    f"running={running}  nodes={progress['nodes']}  "
+                    f"best={best_state[0]}  target={target_score}",
                 )
                 progress["last_report"] = now
 
-            if reached_target:
+        if reached_target:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.terminate()
+        for worker in workers:
+            worker.join()
+
+        while remaining_branches > 0:
+            try:
+                result = result_queue.get_nowait()
+            except queue.Empty:
                 break
+            completed_branches += 1
+            remaining_branches -= 1
+            progress["nodes"] += result["nodes"]
     finally:
-        _stop_process_pool(executor)
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+        for worker in workers:
+            worker.join()
+        _drain_branch_reports(progress_queue, progress)
+        if progress_queue is not None:
+            progress_queue.close()
+            progress_queue.join_thread()
+        if result_queue is not None:
+            result_queue.close()
+            result_queue.join_thread()
 
     return best_state[0], best_state[1], best_state[2], progress["nodes"]
 
@@ -895,6 +1105,7 @@ def save_grid_svg(grid: Grid, owner_grid: Optional[Grid], output_path: str) -> N
 
 def _run_tests() -> None:
     failures: List[str] = []
+    demo_score = 0
 
     def ok(desc: str, value: bool) -> None:
         if not value:
@@ -1091,13 +1302,41 @@ def main() -> None:
     global ROWS, COLS, PIECE_COUNTS
 
     args = sys.argv[1:]
+    branch_stall_timeout: Optional[float] = 60
+
+    filtered_args: List[str] = []
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if arg == "--branch-stall-timeout":
+            if idx + 1 >= len(args):
+                print("error: --branch-stall-timeout requires a numeric value", file=sys.stderr)
+                sys.exit(1)
+            raw_value = args[idx + 1]
+            try:
+                branch_stall_timeout = float(raw_value)
+            except ValueError:
+                print(
+                    f"error: invalid --branch-stall-timeout value: {raw_value!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if branch_stall_timeout <= 0:
+                print("error: --branch-stall-timeout must be > 0", file=sys.stderr)
+                sys.exit(1)
+            idx += 2
+            continue
+        filtered_args.append(arg)
+        idx += 1
+
+    args = filtered_args
 
     known_flags = {"--test", "--full", "--all", "--best"}
     unknown = [a for a in args if a not in known_flags]
     if unknown:
         print(f"error: unknown argument(s): {' '.join(unknown)}", file=sys.stderr)
         print(
-            "usage: python solver.py [--full] [--all | --best] [--test]",
+            "usage: python solver.py [--full] [--all | --best] [--branch-stall-timeout SECONDS] [--test]",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1141,8 +1380,15 @@ def main() -> None:
 
     if find_best:
         print("Search updates: [progress] periodic status, [newbest] when score improves")
+        if branch_stall_timeout is not None:
+            print(f"Branch stall timeout: {branch_stall_timeout:.3f}s")
         print()
-        best_score_val, best_grid_val, best_owner_grid, nodes = solve_max_score_parallel(grid, counts, t0)
+        best_score_val, best_grid_val, best_owner_grid, nodes = solve_max_score_parallel(
+            grid,
+            counts,
+            t0,
+            branch_stall_timeout=branch_stall_timeout,
+        )
         elapsed = time.perf_counter() - t0
         print(
             f"Best score found: {best_score_val}  "
