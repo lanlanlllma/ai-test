@@ -445,6 +445,8 @@ def _progress_print(progress: Optional[dict], message: str) -> None:
     if progress is None:
         print(message)
         return
+    if progress.get("quiet"):
+        return
     lock = progress.get("print_lock")
     if lock is None:
         print(message)
@@ -876,6 +878,7 @@ def solve_max_score_parallel(
     started_at: float,
     report_interval: float = 2.0,
     branch_stall_timeout: Optional[float] = None,
+    quiet: bool = False,
 ) -> Tuple[int, Optional[Grid], Optional[Grid], int]:
     """Run the score search across top-level branches in parallel processes."""
     base_score = score_grid(grid)
@@ -886,6 +889,7 @@ def solve_max_score_parallel(
         "last_report": started_at,
         "report_interval": report_interval,
         "nodes": 0,
+        "quiet": quiet,
     }
 
     branches = _enumerate_root_branches(grid, counts)

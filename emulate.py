@@ -12,6 +12,7 @@ import solver
 PIECE_ORDER = ["I", "O", "S", "Z", "L", "J", "T"]
 DEFAULT_DB_PATH = Path("best_solutions.sqlite3")
 TOTAL_COMBINATIONS = 6 ** len(PIECE_ORDER)
+PROGRESS_BAR_WIDTH = 28
 
 
 def _parse_args(argv: list[str]) -> dict:
@@ -139,6 +140,30 @@ def _filled_cells(grid: Optional[solver.Grid]) -> int:
     return sum(1 for row in grid for cell in row if cell != 0)
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _render_progress(current: int, total: int, started_at: float, best_score: int) -> str:
+    ratio = 0.0 if total <= 0 else min(1.0, current / total)
+    filled = int(PROGRESS_BAR_WIDTH * ratio)
+    bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+    elapsed = time.perf_counter() - started_at
+    eta = 0.0
+    if current > 0 and total >= current:
+        eta = (elapsed / current) * (total - current)
+    return (
+        f"\r[{bar}] {current}/{total} "
+        f"({ratio * 100:5.1f}%)  elapsed={_format_duration(elapsed)}  "
+        f"eta={_format_duration(eta)}  best={best_score}"
+    )
+
+
 def _store_result(
     conn: sqlite3.Connection,
     counts: dict[str, int],
@@ -193,6 +218,7 @@ def _run_one(counts: dict[str, int], branch_stall_timeout: Optional[float]) -> t
         counts,
         started_at,
         branch_stall_timeout=branch_stall_timeout,
+        quiet=True,
     )
     elapsed_seconds = time.perf_counter() - started_at
     return best_score, best_grid, best_owner_grid, nodes, elapsed_seconds
@@ -208,6 +234,8 @@ def main() -> None:
     solver.ROWS = solver.FULL_ROWS
     solver.COLS = solver.FULL_COLS
 
+    target_total = TOTAL_COMBINATIONS if limit is None else min(limit, TOTAL_COMBINATIONS)
+
     print(
         f"Enumerating all {len(PIECE_ORDER)} tetromino count combinations "
         f"(0..5 each, total={TOTAL_COMBINATIONS}) into {db_path}"
@@ -222,6 +250,7 @@ def main() -> None:
     try:
         _ensure_schema(conn)
         total_started = time.perf_counter()
+        global_best_score = 0
 
         for idx, counts in enumerate(_iter_count_combinations(), start=1):
             if limit is not None and idx > limit:
@@ -240,20 +269,19 @@ def main() -> None:
                 nodes,
                 elapsed_seconds,
             )
+            global_best_score = max(global_best_score, best_score)
+
+            progress_line = _render_progress(idx, target_total, total_started, global_best_score)
+            print(progress_line, end="", flush=True)
 
             if idx % report_every == 0:
                 conn.commit()
-                print(
-                    f"[{idx}] counts={{I:{counts['I']}, O:{counts['O']}, S:{counts['S']}, "
-                    f"Z:{counts['Z']}, L:{counts['L']}, J:{counts['J']}, T:{counts['T']}}}  "
-                    f"score={best_score}  "
-                    f"filled={_filled_cells(best_grid)}  nodes={nodes}  elapsed={elapsed_seconds:.3f}s"
-                )
 
         conn.commit()
         total_elapsed = time.perf_counter() - total_started
         rows_written = conn.execute("SELECT COUNT(*) FROM best_solutions").fetchone()[0]
-        print()
+        if target_total > 0:
+            print()
         print(f"Finished. Rows in database: {rows_written}. Total elapsed: {total_elapsed:.3f}s")
     finally:
         conn.close()
