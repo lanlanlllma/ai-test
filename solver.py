@@ -39,13 +39,15 @@ Usage
 
 from __future__ import annotations
 
+import argparse
+import importlib
 import os
 import multiprocessing as mp
 import queue
 import sys
 import time
 from collections import deque
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # 1. Piece definitions (19 distinct rotations across 7 tetromino types)
@@ -422,8 +424,12 @@ def _reconstruct_placements(grid: Grid, owner_grid: Optional[Grid]) -> PlacedLis
     return [(name, rot_idx, adj_r, adj_c) for _, name, rot_idx, adj_r, adj_c in pieces]
 
 
+def reconstruct_placements(grid: Grid, owner_grid: Optional[Grid]) -> PlacedList:
+    return _reconstruct_placements(grid, owner_grid)
+
+
 def _print_reconstructed_placement_log(grid: Grid, owner_grid: Optional[Grid]) -> None:
-    placed = _reconstruct_placements(grid, owner_grid)
+    placed = reconstruct_placements(grid, owner_grid)
     if not placed:
         return
     _print_placement_log(placed)
@@ -558,6 +564,7 @@ def _solve_max_score_branch(
     branch_grid: Grid,
     branch_owner_grid: Grid,
     branch_counts: Counts,
+    branch_score: int,
     started_at: float,
     target_score: int,
     report_interval: float,
@@ -565,7 +572,7 @@ def _solve_max_score_branch(
     progress_queue,
 ) -> Tuple[int, Optional[Grid], Optional[Grid], int]:
     local_state: List = [
-        score_grid(branch_grid),
+        branch_score,
         _clone_grid(branch_grid),
         _clone_grid(branch_owner_grid),
     ]
@@ -585,6 +592,7 @@ def _solve_max_score_branch(
         "target_score": target_score,
         "stop_reason": "completed",
         "initial_pieces_left": sum(branch_counts.values()) + 1,
+        "initial_filled_cells": _count_filled_cells(branch_grid),
     }
     solve_max_score(branch_grid, branch_counts, local_state, local_progress, branch_owner_grid)
     if progress_queue is not None:
@@ -606,6 +614,7 @@ def _solve_max_score_branch_process(
     branch_grid: Grid,
     branch_owner_grid: Grid,
     branch_counts: Counts,
+    branch_score: int,
     started_at: float,
     target_score: int,
     report_interval: float,
@@ -618,6 +627,7 @@ def _solve_max_score_branch_process(
         branch_grid,
         branch_owner_grid,
         branch_counts,
+        branch_score,
         started_at,
         target_score,
         report_interval,
@@ -631,6 +641,10 @@ def _solve_max_score_branch_process(
         "best_owner_grid": best_owner_grid,
         "nodes": nodes,
     })
+
+
+def _select_multiprocessing_context() -> Any:
+    return mp.get_context("spawn")
 
 
 def _drain_branch_reports(progress_queue, progress: dict) -> None:
@@ -797,11 +811,10 @@ def solve_max_score(
     # rows is filled_in_partial_rows + max_placeable.
     remaining_rows = ROWS - anchor_r
     pieces_left = sum(counts.values())
-    # All empty cells lie in rows anchor_r..ROWS-1 (first-empty-cell invariant).
-    empty_cells = sum(
-        1 for r in range(anchor_r, ROWS) for c in range(COLS)
-        if grid[r][c] == 0
-    )
+    initial_filled_cells = 0
+    if progress is not None:
+        initial_filled_cells = progress.get("initial_filled_cells", 0)
+    empty_cells = ROWS * COLS - (initial_filled_cells + (progress.get("initial_pieces_left", pieces_left) - pieces_left) * 4 if progress is not None else _count_filled_cells(grid))
     filled_in_partial_rows = remaining_rows * COLS - empty_cells
     max_additional_rows = min(
         remaining_rows,
@@ -843,8 +856,8 @@ def solve_max_score(
                     return
 
 
-def _enumerate_root_branches(grid: Grid, counts: Counts) -> List[Tuple[Grid, Grid, Counts]]:
-    branches: List[Tuple[Grid, Grid, Counts]] = []
+def _enumerate_root_branches(grid: Grid, counts: Counts) -> List[Tuple[Grid, Grid, Counts, int]]:
+    branches: List[Tuple[Grid, Grid, Counts, int]] = []
     pos = find_first_empty(grid)
     if pos is None:
         return branches
@@ -867,7 +880,7 @@ def _enumerate_root_branches(grid: Grid, counts: Counts) -> List[Tuple[Grid, Gri
                 place(branch_owner_grid, shape, adj_r, adj_c, 1)
                 branch_counts[name] -= 1
                 if not prune_by_region(branch_grid):
-                    branches.append((branch_grid, branch_owner_grid, branch_counts))
+                    branches.append((branch_grid, branch_owner_grid, branch_counts, score_grid(branch_grid)))
 
     return branches
 
@@ -909,18 +922,19 @@ def solve_max_score_parallel(
     else:
         worker_count = max(1, min(len(branches), max_workers, available_cpus))
     completed_branches = 0
-    mp_context = mp.get_context("fork")
+    mp_context = _select_multiprocessing_context()
     progress_queue = None
     result_queue = None
     workers = []
     try:
         if worker_count <= 1:
-            for idx, (branch_grid, branch_owner_grid, branch_counts) in enumerate(branches):
+            for idx, (branch_grid, branch_owner_grid, branch_counts, branch_score) in enumerate(branches):
                 score, best_grid, best_owner_grid, nodes = _solve_max_score_branch(
                     idx,
                     branch_grid,
                     branch_owner_grid,
                     branch_counts,
+                    branch_score,
                     started_at,
                     target_score,
                     report_interval,
@@ -957,7 +971,13 @@ def solve_max_score_parallel(
         worker_specs = list(enumerate(branches))
         active_workers = {}
 
-        def _start_worker(branch_idx: int, branch_grid: Grid, branch_owner_grid: Grid, branch_counts: Counts) -> None:
+        def _start_worker(
+            branch_idx: int,
+            branch_grid: Grid,
+            branch_owner_grid: Grid,
+            branch_counts: Counts,
+            branch_score: int,
+        ) -> None:
             worker = mp_context.Process(
                 target=_solve_max_score_branch_process,
                 args=(
@@ -965,6 +985,7 @@ def solve_max_score_parallel(
                     branch_grid,
                     branch_owner_grid,
                     branch_counts,
+                    branch_score,
                     started_at,
                     target_score,
                     report_interval,
@@ -980,8 +1001,8 @@ def solve_max_score_parallel(
 
         next_branch = 0
         while next_branch < min(worker_count, len(worker_specs)):
-            branch_idx, (branch_grid, branch_owner_grid, branch_counts) = worker_specs[next_branch]
-            _start_worker(branch_idx, branch_grid, branch_owner_grid, branch_counts)
+            branch_idx, (branch_grid, branch_owner_grid, branch_counts, branch_score) = worker_specs[next_branch]
+            _start_worker(branch_idx, branch_grid, branch_owner_grid, branch_counts, branch_score)
             next_branch += 1
 
         remaining_branches = len(branches)
@@ -992,6 +1013,22 @@ def solve_max_score_parallel(
             try:
                 result = result_queue.get(timeout=report_interval)
             except queue.Empty:
+                dead_workers = []
+                live_workers = 0
+                for branch_idx, worker in list(active_workers.items()):
+                    if worker.is_alive():
+                        live_workers += 1
+                    else:
+                        dead_workers.append(branch_idx)
+                if dead_workers:
+                    for branch_idx in dead_workers:
+                        worker = active_workers.pop(branch_idx)
+                        worker.join(timeout=0.1)
+                    if live_workers == 0:
+                        raise RuntimeError(
+                            "all solver workers exited before posting a result; "
+                            "nested parallelism or multiprocessing startup likely failed"
+                        )
                 now = time.perf_counter()
                 running = sum(1 for worker in workers if worker.is_alive())
                 _progress_print(
@@ -1033,8 +1070,8 @@ def solve_max_score_parallel(
                 break
 
             if next_branch < len(worker_specs):
-                queued_branch_idx, (branch_grid, branch_owner_grid, branch_counts) = worker_specs[next_branch]
-                _start_worker(queued_branch_idx, branch_grid, branch_owner_grid, branch_counts)
+                queued_branch_idx, (branch_grid, branch_owner_grid, branch_counts, branch_score) = worker_specs[next_branch]
+                _start_worker(queued_branch_idx, branch_grid, branch_owner_grid, branch_counts, branch_score)
                 next_branch += 1
 
             now = time.perf_counter()
@@ -1144,7 +1181,15 @@ def score_breakdown(grid: Grid) -> List[dict]:
 
 def score_grid(grid: Grid) -> int:
     """Return the total score for *grid* according to the scoring rules."""
-    return sum(entry["total"] for entry in score_breakdown(grid))
+    total = 0
+    for row in grid:
+        if any(cell == 0 for cell in row):
+            continue
+        colours = len(set(row))
+        total += POINTS_PER_ROW
+        if colours >= BONUS_COLOUR_THRESHOLD:
+            total += BONUS_POINTS_PER_ROW
+    return total
 
 
 def print_score(grid: Grid) -> None:
@@ -1263,202 +1308,35 @@ def save_grid_svg(grid: Grid, owner_grid: Optional[Grid], output_path: str) -> N
 # 8. Built-in unit tests
 # ---------------------------------------------------------------------------
 
-def _run_tests() -> None:
-    failures: List[str] = []
-    demo_score = 0
+def _positive_float_arg(raw_value: str) -> float:
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --branch-stall-timeout value: {raw_value!r}"
+        ) from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("--branch-stall-timeout must be > 0")
+    return value
 
-    def ok(desc: str, value: bool) -> None:
-        if not value:
-            failures.append(f"FAIL [{desc}]")
-        else:
-            print(f"  OK  [{desc}]")
 
-    def eq(desc: str, actual, expected) -> None:
-        ok(f"{desc}: got {actual!r}, want {expected!r}", actual == expected)
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="python solver.py")
+    parser.add_argument("--test", action="store_true", help="Run the project test suite")
+    parser.add_argument("--full", action="store_true", help="Use the full-size board configuration")
+    parser.add_argument("--all", action="store_true", help="Enumerate all full solutions")
+    parser.add_argument("--best", action="store_true", help="Search for the highest-scoring arrangement")
+    parser.add_argument(
+        "--branch-stall-timeout",
+        type=_positive_float_arg,
+        default=60.0,
+        help="Stop a score-search branch after this many idle seconds",
+    )
+    return parser
 
-    print("=== Running unit tests ===\n")
 
-    # 1 – normalise
-    eq("normalise O", _normalise([(2, 3), (2, 4), (3, 3), (3, 4)]),
-       ((0, 0), (0, 1), (1, 0), (1, 1)))
-
-    # 2 – rotation counts
-    eq("I rotations == 2", len(PIECES["I"]), 2)
-    eq("O rotations == 1", len(PIECES["O"]), 1)
-    eq("T rotations == 4", len(PIECES["T"]), 4)
-    eq("PIECES has 7 types", len(PIECES), 7)
-    eq("total rotations == 19", sum(len(v) for v in PIECES.values()), 19)
-
-    # 3 – anchor invariants
-    ok("every anchor cell is IN its shape", all(
-        PIECE_ANCHORS[n][i] in shape
-        for n, rots in PIECES.items()
-        for i, shape in enumerate(rots)
-    ))
-    ok("anchor is topmost-then-leftmost", all(
-        PIECE_ANCHORS[n][i] == (
-            (lambda s: (
-                min(dr for dr, _ in s),
-                min(dc for dr, dc in s if dr == min(dr2 for dr2, _ in s))
-            ))(shape)
-        )
-        for n, rots in PIECES.items()
-        for i, shape in enumerate(rots)
-    ))
-    eq("L-origin is shape centre", _shape_origin_offset(PIECES["L"][0]), (0.75, 0.75))
-
-    # 4 – S-piece horizontal anchor is (0,1)
-    s_h = PIECES["S"][0]
-    eq("S-horizontal shape[0]", s_h[0], (0, 1))
-    eq("S-horizontal anchor", PIECE_ANCHORS["S"][0], (0, 1))
-
-    # 5 – placing S-horizontal so anchor covers cell (2,3)
-    # Temporarily use a 10×10 grid for this geometry test.
-    global ROWS, COLS
-    _save_rows, _save_cols = ROWS, COLS
-    ROWS, COLS = 10, 10
-    g7 = [[0] * 10 for _ in range(10)]
-    off_r, off_c = PIECE_ANCHORS["S"][0]
-    adj_r, adj_c = 2 - off_r, 3 - off_c
-    place(g7, s_h, adj_r, adj_c, _PIECE_LABELS["S"])
-    eq("S-horizontal covers anchor (2,3)", g7[2][3], _PIECE_LABELS["S"])
-    ROWS, COLS = _save_rows, _save_cols
-
-    # 6 – can_place / place / unplace
-    g = empty_grid()
-    shape_O = PIECES["O"][0]
-    ok("can_place O at (0,0)", can_place(g, shape_O, 0, 0))
-    ok("can_place O at top-right corner is False",
-       not can_place(g, shape_O, 0, COLS - 1))
-    g2 = empty_grid()
-    place(g2, shape_O, 0, 0, 1)
-    eq("place O sets (0,0)", g2[0][0], 1)
-    eq("place O sets (0,1)", g2[0][1], 1)
-    unplace(g2, shape_O, 0, 0)
-    eq("unplace O clears (0,0)", g2[0][0], 0)
-    owner_test = empty_grid()
-    place(g2, shape_O, 0, 0, _PIECE_LABELS["O"])
-    place(owner_test, shape_O, 0, 0, 1)
-    eq("reconstruct best placement log", _reconstruct_placements(g2, owner_test), [("O", 0, 0, 0)])
-    unplace(g2, shape_O, 0, 0)
-    unplace(owner_test, shape_O, 0, 0)
-
-    # 7 – flood fill
-    g3 = empty_grid()
-    sizes = _flood_fill_sizes(g3)
-    eq("empty grid: 1 region", len(sizes), 1)
-    eq("empty grid: region size = ROWS*COLS", sizes[0], ROWS * COLS)
-
-    # 8 – prune_by_region detects 2-cell isolated pocket
-    g4 = empty_grid()
-    for c in range(COLS):
-        g4[0][c] = 1
-    for c in range(COLS):
-        g4[1][c] = 1
-    g4[1][4] = 0
-    g4[1][5] = 0
-    for c in range(COLS):
-        g4[2][c] = 1
-    ok("prune detects isolated 2-cell region", prune_by_region(g4))
-
-    # 9 – parity pruning: 5 T-pieces → unsolvable at balance 0
-    counts9: Counts = {name: 0 for name in PIECES}
-    counts9["T"] = 5
-    g9 = [[0] * COLS for _ in range(ROWS)]
-    ok("parity prune: 5 T at balance 0 → prune", prune_by_parity(g9, counts9))
-
-    # 10 – parity pruning: 4 T-pieces → OK at balance 0
-    counts10: Counts = {name: 0 for name in PIECES}
-    counts10["T"] = 4
-    ok("parity prune: 4 T at balance 0 → no prune",
-       not prune_by_parity(g9, counts10))
-
-    # 11 – validate_solution fails on empty grid
-    counts11: Counts = {name: 5 for name in PIECES}
-    ok("validate_solution fails on empty grid",
-       not validate_solution(g, counts11))
-
-    # 12 – solve actually finds a solution for the demo config
-    ROWS, COLS = DEMO_ROWS, DEMO_COLS
-    g_demo = [[0] * DEMO_COLS for _ in range(DEMO_ROWS)]
-    counts_demo = dict(DEMO_PIECE_COUNTS)
-    placed_demo: PlacedList = []
-    found = solve(g_demo, counts_demo, placed_demo)
-    ok("solve finds demo solution", found)
-    if found:
-        ok("demo solution is valid", validate_solution(g_demo, counts_demo))
-    ROWS, COLS = _save_rows, _save_cols
-
-    # 13 – score_grid: empty grid scores 0
-    g_empty = [[0] * COLS for _ in range(ROWS)]
-    eq("score empty grid == 0", score_grid(g_empty), 0)
-    eq("score_breakdown empty grid == []", score_breakdown(g_empty), [])
-
-    # 14 – score_grid: one fully filled row, 2 distinct types → 10 pts (no bonus)
-    g_s1 = [[0] * COLS for _ in range(ROWS)]
-    # Fill row 0: first 5 cells = label 1, next 5 = label 2 (2 colours < 4)
-    for c in range(5):
-        g_s1[0][c] = 1
-    for c in range(5, COLS):
-        g_s1[0][c] = 2
-    bd1 = score_breakdown(g_s1)
-    eq("1 filled row (2 colours): 1 entry", len(bd1), 1)
-    eq("1 filled row (2 colours): no bonus", bd1[0]["bonus"], 0)
-    eq("1 filled row (2 colours): total 10", bd1[0]["total"], 10)
-    eq("score 1 filled row (2 colours) == 10", score_grid(g_s1), 10)
-
-    # 15 – score_grid: one fully filled row, 4 distinct types → 20 pts (bonus)
-    g_s2 = [[0] * COLS for _ in range(ROWS)]
-    # Fill row 0 with 4 different labels (COLS=10: labels 1,1,1,2,2,3,3,4,4,4)
-    for c, lbl in enumerate([1, 1, 1, 2, 2, 3, 3, 4, 4, 4][:COLS]):
-        g_s2[0][c] = lbl
-    bd2 = score_breakdown(g_s2)
-    eq("1 filled row (4 colours): bonus == 10", bd2[0]["bonus"], 10)
-    eq("1 filled row (4 colours): total 20", bd2[0]["total"], 20)
-    eq("score 1 filled row (4 colours) == 20", score_grid(g_s2), 20)
-
-    # 16 – score_grid: demo solution scores at least 10 pts per row
-    if found:
-        demo_score = score_grid(g_demo)
-        ok(f"demo solution score >= {DEMO_ROWS * POINTS_PER_ROW}",
-           demo_score >= DEMO_ROWS * POINTS_PER_ROW)
-
-    # 17 – solve_max_score: empty-inventory → score 0
-    ROWS, COLS = DEMO_ROWS, DEMO_COLS
-    g_ms1 = [[0] * DEMO_COLS for _ in range(DEMO_ROWS)]
-    counts_ms1: Counts = {name: 0 for name in PIECES}
-    state_ms1: List = [0, None]
-    solve_max_score(g_ms1, counts_ms1, state_ms1)
-    eq("solve_max_score empty inventory → score 0", state_ms1[0], 0)
-
-    # 18 – solve_max_score: demo config scores at least as well as solve
-    g_ms2 = [[0] * DEMO_COLS for _ in range(DEMO_ROWS)]
-    counts_ms2 = dict(DEMO_PIECE_COUNTS)
-    state_ms2: List = [0, None]
-    solve_max_score(g_ms2, counts_ms2, state_ms2)
-    ok("solve_max_score demo score >= demo solve score",
-       state_ms2[0] >= (demo_score if found else 0))
-
-    # 19 – solve_max_score: giving up a piece can match or beat full-fill
-    # Use a single-piece config that can fill exactly one row of a 1×4 grid.
-    _save_rows2, _save_cols2 = ROWS, COLS
-    ROWS, COLS = 1, 4
-    g_ms3 = [[0] * 4 for _ in range(1)]
-    counts_ms3: Counts = {name: 0 for name in PIECES}
-    counts_ms3["I"] = 1
-    state_ms3: List = [0, None]
-    solve_max_score(g_ms3, counts_ms3, state_ms3)
-    eq("solve_max_score 1×4 with 1 I-piece fills row → score 10",
-       state_ms3[0], 10)
-    ROWS, COLS = _save_rows2, _save_cols2
-
-    print()
-    if failures:
-        for f in failures:
-            print(f)
-        sys.exit(1)
-    else:
-        print(f"All 38 tests passed.")
+def run_cli_tests() -> None:
+    importlib.import_module("test_solver").run_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -1468,53 +1346,16 @@ def _run_tests() -> None:
 def main() -> None:
     global ROWS, COLS, PIECE_COUNTS
 
-    args = sys.argv[1:]
-    branch_stall_timeout: Optional[float] = 60
+    args = _build_parser().parse_args(sys.argv[1:])
+    branch_stall_timeout: Optional[float] = args.branch_stall_timeout
 
-    filtered_args: List[str] = []
-    idx = 0
-    while idx < len(args):
-        arg = args[idx]
-        if arg == "--branch-stall-timeout":
-            if idx + 1 >= len(args):
-                print("error: --branch-stall-timeout requires a numeric value", file=sys.stderr)
-                sys.exit(1)
-            raw_value = args[idx + 1]
-            try:
-                branch_stall_timeout = float(raw_value)
-            except ValueError:
-                print(
-                    f"error: invalid --branch-stall-timeout value: {raw_value!r}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            if branch_stall_timeout <= 0:
-                print("error: --branch-stall-timeout must be > 0", file=sys.stderr)
-                sys.exit(1)
-            idx += 2
-            continue
-        filtered_args.append(arg)
-        idx += 1
-
-    args = filtered_args
-
-    known_flags = {"--test", "--full", "--all", "--best"}
-    unknown = [a for a in args if a not in known_flags]
-    if unknown:
-        print(f"error: unknown argument(s): {' '.join(unknown)}", file=sys.stderr)
-        print(
-            "usage: python solver.py [--full] [--all | --best] [--branch-stall-timeout SECONDS] [--test]",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    if "--test" in args:
-        _run_tests()
+    if args.test:
+        run_cli_tests()
         return
 
-    use_full = "--full" in args
-    find_all = "--all" in args
-    find_best = "--best" in args
+    use_full = args.full
+    find_all = args.all
+    find_best = args.best
 
     if use_full:
         ROWS = FULL_ROWS

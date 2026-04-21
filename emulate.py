@@ -1,8 +1,10 @@
+import argparse
 import json
+import multiprocessing as mp
 import sqlite3
 import sys
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from itertools import product
 from pathlib import Path
 from typing import Iterator, Optional
@@ -16,103 +18,71 @@ TOTAL_COMBINATIONS = 6 ** len(PIECE_ORDER)
 PROGRESS_BAR_WIDTH = 28
 
 
-def _parse_args(argv: list[str]) -> dict:
-    db_path = DEFAULT_DB_PATH
-    branch_stall_timeout: Optional[float] = None
-    limit: Optional[int] = None
-    report_every = 25
-    outer_workers = 1
-    solver_workers: Optional[int] = None
+def _positive_int(raw_value: str, option_name: str) -> int:
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid {option_name} value: {raw_value!r}") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"{option_name} must be > 0")
+    return value
 
-    idx = 0
-    while idx < len(argv):
-        arg = argv[idx]
-        if arg == "--db":
-            if idx + 1 >= len(argv):
-                raise SystemExit("error: --db requires a path")
-            db_path = Path(argv[idx + 1])
-            idx += 2
-            continue
-        if arg == "--branch-stall-timeout":
-            if idx + 1 >= len(argv):
-                raise SystemExit("error: --branch-stall-timeout requires a numeric value")
-            try:
-                branch_stall_timeout = float(argv[idx + 1])
-            except ValueError as exc:
-                raise SystemExit(
-                    f"error: invalid --branch-stall-timeout value: {argv[idx + 1]!r}"
-                ) from exc
-            if branch_stall_timeout <= 0:
-                raise SystemExit("error: --branch-stall-timeout must be > 0")
-            idx += 2
-            continue
-        if arg == "--limit":
-            if idx + 1 >= len(argv):
-                raise SystemExit("error: --limit requires an integer value")
-            try:
-                limit = int(argv[idx + 1])
-            except ValueError as exc:
-                raise SystemExit(f"error: invalid --limit value: {argv[idx + 1]!r}") from exc
-            if limit <= 0:
-                raise SystemExit("error: --limit must be > 0")
-            idx += 2
-            continue
-        if arg == "--report-every":
-            if idx + 1 >= len(argv):
-                raise SystemExit("error: --report-every requires an integer value")
-            try:
-                report_every = int(argv[idx + 1])
-            except ValueError as exc:
-                raise SystemExit(
-                    f"error: invalid --report-every value: {argv[idx + 1]!r}"
-                ) from exc
-            if report_every <= 0:
-                raise SystemExit("error: --report-every must be > 0")
-            idx += 2
-            continue
-        if arg == "--outer-workers":
-            if idx + 1 >= len(argv):
-                raise SystemExit("error: --outer-workers requires an integer value")
-            try:
-                outer_workers = int(argv[idx + 1])
-            except ValueError as exc:
-                raise SystemExit(
-                    f"error: invalid --outer-workers value: {argv[idx + 1]!r}"
-                ) from exc
-            if outer_workers <= 0:
-                raise SystemExit("error: --outer-workers must be > 0")
-            idx += 2
-            continue
-        if arg == "--solver-workers":
-            if idx + 1 >= len(argv):
-                raise SystemExit("error: --solver-workers requires an integer value")
-            try:
-                solver_workers = int(argv[idx + 1])
-            except ValueError as exc:
-                raise SystemExit(
-                    f"error: invalid --solver-workers value: {argv[idx + 1]!r}"
-                ) from exc
-            if solver_workers <= 0:
-                raise SystemExit("error: --solver-workers must be > 0")
-            idx += 2
-            continue
-        raise SystemExit(
-            "usage: python emulate.py [--db PATH] [--branch-stall-timeout SECONDS] "
-            "[--limit N] [--report-every N] [--outer-workers N] [--solver-workers N]"
-        )
 
-    return {
-        "db_path": db_path,
-        "branch_stall_timeout": branch_stall_timeout,
-        "limit": limit,
-        "report_every": report_every,
-        "outer_workers": outer_workers,
-        "solver_workers": solver_workers,
-    }
+def _positive_float(raw_value: str, option_name: str) -> float:
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid {option_name} value: {raw_value!r}") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"{option_name} must be > 0")
+    return value
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python emulate.py",
+        description="Enumerate tetromino count combinations and store best scores.",
+    )
+    parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path")
+    parser.add_argument(
+        "--branch-stall-timeout",
+        type=lambda raw: _positive_float(raw, "--branch-stall-timeout"),
+        default=None,
+        help="Stop a branch after this many seconds without improvement",
+    )
+    parser.add_argument(
+        "--limit",
+        type=lambda raw: _positive_int(raw, "--limit"),
+        default=None,
+        help="Only evaluate the first N combinations",
+    )
+    parser.add_argument(
+        "--report-every",
+        type=lambda raw: _positive_int(raw, "--report-every"),
+        default=25,
+        help="Commit and print a snapshot every N completed combinations",
+    )
+    parser.add_argument(
+        "--outer-workers",
+        type=lambda raw: _positive_int(raw, "--outer-workers"),
+        default=1,
+        help="Number of concurrent enumeration jobs",
+    )
+    parser.add_argument(
+        "--solver-workers",
+        type=lambda raw: _positive_int(raw, "--solver-workers"),
+        default=None,
+        help="Maximum worker processes used by each solver job",
+    )
+    return parser
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    return _build_parser().parse_args(argv)
 
 
 def _iter_count_combinations() -> Iterator[dict[str, int]]:
-    for values in product(range(6), repeat=len(PIECE_ORDER)):
+    for values in product(range(5, -1, -1), repeat=len(PIECE_ORDER)):
         yield dict(zip(PIECE_ORDER, values, strict=True))
 
 
@@ -145,6 +115,20 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _counts_key(counts: dict[str, int]) -> tuple[int, ...]:
+    return tuple(counts[name] for name in PIECE_ORDER)
+
+
+def _load_existing_keys(conn: sqlite3.Connection) -> set[tuple[int, ...]]:
+    rows = conn.execute(
+        """
+        SELECT i_count, o_count, s_count, z_count, l_count, j_count, t_count
+        FROM best_solutions
+        """
+    ).fetchall()
+    return {tuple(row) for row in rows}
+
+
 def _serialize_grid(grid: Optional[solver.Grid]) -> str:
     return json.dumps(grid if grid is not None else [])
 
@@ -152,7 +136,7 @@ def _serialize_grid(grid: Optional[solver.Grid]) -> str:
 def _serialize_placements(grid: Optional[solver.Grid], owner_grid: Optional[solver.Grid]) -> str:
     if grid is None or owner_grid is None:
         return json.dumps([])
-    placements = solver._reconstruct_placements(grid, owner_grid)
+    placements = solver.reconstruct_placements(grid, owner_grid)
     serializable = [
         {
             "piece": name,
@@ -261,29 +245,53 @@ def _run_one(
     counts: dict[str, int],
     branch_stall_timeout: Optional[float],
     solver_workers: Optional[int],
+    use_parallel_solver: bool,
 ) -> tuple[dict[str, int], int, Optional[solver.Grid], Optional[solver.Grid], int, float]:
     grid = solver.empty_grid()
     started_at = time.perf_counter()
-    best_score, best_grid, best_owner_grid, nodes = solver.solve_max_score_parallel(
-        grid,
-        counts,
-        started_at,
-        branch_stall_timeout=branch_stall_timeout,
-        quiet=True,
-        max_workers=solver_workers,
-    )
+    if use_parallel_solver:
+        best_score, best_grid, best_owner_grid, nodes = solver.solve_max_score_parallel(
+            grid,
+            counts,
+            started_at,
+            branch_stall_timeout=branch_stall_timeout,
+            quiet=True,
+            max_workers=solver_workers,
+        )
+    else:
+        owner_grid = [[0] * solver.COLS for _ in range(solver.ROWS)]
+        state: list[int | solver.Grid | None] = [solver.score_grid(grid), solver.empty_grid(), owner_grid]
+        progress = {
+            "started_at": started_at,
+            "last_report": started_at,
+            "last_newbest_at": started_at,
+            "nodes": 0,
+            "best_score": state[0],
+            "progress_enabled": False,
+            "newbest_enabled": False,
+            "mirror_local_output": False,
+            "report_interval": 2.0,
+            "stall_timeout": branch_stall_timeout,
+            "initial_pieces_left": sum(counts.values()),
+            "initial_filled_cells": solver._count_filled_cells(grid),
+        }
+        solver.solve_max_score(grid, counts, state, progress, owner_grid)
+        best_score = state[0] if isinstance(state[0], int) else 0
+        best_grid = state[1] if isinstance(state[1], list) else None
+        best_owner_grid = state[2] if isinstance(state[2], list) else None
+        nodes = int(progress["nodes"])
     elapsed_seconds = time.perf_counter() - started_at
     return counts, best_score, best_grid, best_owner_grid, nodes, elapsed_seconds
 
 
 def main() -> None:
     options = _parse_args(sys.argv[1:])
-    db_path: Path = options["db_path"]
-    branch_stall_timeout: Optional[float] = options["branch_stall_timeout"]
-    limit: Optional[int] = options["limit"]
-    report_every: int = options["report_every"]
-    outer_workers: int = options["outer_workers"]
-    solver_workers: Optional[int] = options["solver_workers"]
+    db_path = options.db
+    branch_stall_timeout = options.branch_stall_timeout
+    limit = options.limit
+    report_every = options.report_every
+    outer_workers = options.outer_workers
+    solver_workers = options.solver_workers
 
     solver.ROWS = solver.FULL_ROWS
     solver.COLS = solver.FULL_COLS
@@ -306,19 +314,49 @@ def main() -> None:
     conn = sqlite3.connect(db_path)
     try:
         _ensure_schema(conn)
+        existing_keys = _load_existing_keys(conn)
+        existing_total = len(existing_keys)
+
+        pending_counts = []
+        for idx, counts in enumerate(_iter_count_combinations(), start=1):
+            if limit is not None and idx > limit:
+                break
+            if _counts_key(counts) in existing_keys:
+                continue
+            pending_counts.append(counts)
+
+        target_total = len(pending_counts)
+
         total_started = time.perf_counter()
         global_best_score = 0
+        use_parallel_solver = False
 
-        counts_iter = _iter_count_combinations()
+        print(f"Existing rows skipped: {existing_total}")
+        print(f"Pending combinations to run: {target_total}")
+        print("Using process-based outer workers with sequential inner solver.")
+        if target_total == 0:
+            rows_written = conn.execute("SELECT COUNT(*) FROM best_solutions").fetchone()[0]
+            print("Nothing to do - all selected combinations already exist in the database.")
+            print(f"Finished. Rows in database: {rows_written}. Total elapsed: 0.000s")
+            return
+
+        counts_iter = iter(pending_counts)
         submitted = 0
         completed = 0
         future_to_index = {}
+        mp_context = mp.get_context("spawn")
 
-        with ThreadPoolExecutor(max_workers=outer_workers) as executor:
+        with ProcessPoolExecutor(max_workers=outer_workers, mp_context=mp_context) as executor:
             while submitted < min(target_total, outer_workers):
                 counts = next(counts_iter)
                 submitted += 1
-                future = executor.submit(_run_one, counts, branch_stall_timeout, solver_workers)
+                future = executor.submit(
+                    _run_one,
+                    counts,
+                    branch_stall_timeout,
+                    solver_workers,
+                    use_parallel_solver,
+                )
                 future_to_index[future] = submitted
 
             while future_to_index:
@@ -360,7 +398,13 @@ def main() -> None:
                     if submitted < target_total:
                         counts = next(counts_iter)
                         submitted += 1
-                        next_future = executor.submit(_run_one, counts, branch_stall_timeout, solver_workers)
+                        next_future = executor.submit(
+                            _run_one,
+                            counts,
+                            branch_stall_timeout,
+                            solver_workers,
+                            use_parallel_solver,
+                        )
                         future_to_index[next_future] = submitted
 
         conn.commit()
